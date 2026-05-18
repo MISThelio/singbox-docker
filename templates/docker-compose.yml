@@ -1,0 +1,10 @@
+services:
+  sing-box:
+    image: ghcr.io/sagernet/sing-box:v1.13.12
+    container_name: sing-box
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./config:/etc/sing-box
+      - ./data:/var/lib/sing-box
+    command: -D /var/lib/sing-box -C /etc/sing-box run
