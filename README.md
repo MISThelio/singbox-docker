@@ -10,6 +10,7 @@ Docker 版 sing-box 多入站管理脚本。核心运行使用 SagerNet 官方 s
 - 添加 Hysteria2 入站
 - 添加 Door 端口转发入站
 - 删除入站、查看配置、检查配置、备份恢复
+- 查看并启用宿主机 BBR
 - 支持通过 `SING_BOX_IMAGE` 或 `SING_BOX_VERSION` 覆盖镜像
 
 ## 快速使用
@@ -29,7 +30,7 @@ sudo sb
 远程安装时需要先提供脚本地址：
 
 ```bash
-sudo SCRIPT_URL=https://你的地址/singbox-docker.sh ./install.sh
+sudo SCRIPT_URL=https://raw.githubusercontent.com/MISThelio/singbox-docker/main/singbox-docker.sh ./install.sh
 ```
 
 ## 目录
@@ -67,6 +68,7 @@ sudo SING_BOX_IMAGE=local/sing-box:v1.13.12 ./singbox-docker.sh
 
 - VLESS Reality 通常只需要放行 TCP 端口。
 - Hysteria2 需要放行 UDP 端口，脚本也会提示 TCP/UDP 安全组。
+- BBR 是宿主机 Linux 内核参数，不是 sing-box 或 Docker 容器配置；它主要影响 TCP，对 Hysteria2 的 UDP 流量基本无效。
 - 如果使用云服务器，请同时检查系统防火墙和云厂商安全组。
 - 脚本不会覆盖已存在的 `/opt/sing-box/docker-compose.yml`，避免误覆盖用户修改。
 

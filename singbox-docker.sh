@@ -515,6 +515,82 @@ show_version(){
   docker ps -a --filter name=sing-box
 }
 
+show_bbr_status(){
+  echo "内核版本："
+  uname -r || true
+
+  echo
+  echo "当前 TCP 拥塞控制："
+  sysctl net.ipv4.tcp_congestion_control 2>/dev/null || true
+
+  echo
+  echo "当前默认队列算法："
+  sysctl net.core.default_qdisc 2>/dev/null || true
+
+  echo
+  echo "可用 TCP 拥塞控制算法："
+  sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null || true
+
+  echo
+  if sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null | grep -qx bbr; then
+    green "BBR 当前已启用"
+  else
+    yellow "BBR 当前未启用"
+  fi
+}
+
+enable_bbr(){
+  check_root
+
+  if command -v modprobe >/dev/null 2>&1; then
+    modprobe tcp_bbr 2>/dev/null || yellow "tcp_bbr 模块加载失败，可能已内建或当前内核不支持"
+  else
+    yellow "未找到 modprobe，跳过模块加载"
+  fi
+
+  echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
+
+  cat > /etc/sysctl.d/99-singbox-bbr.conf <<'EOFBBR'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOFBBR
+
+  if sysctl --system; then
+    show_bbr_status
+  else
+    red "应用 sysctl 配置失败，请检查当前系统内核是否支持 BBR"
+    return 1
+  fi
+
+  if sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null | grep -qx bbr; then
+    green "BBR 启用完成。Reality / TCP 转发会受益，Hysteria2 UDP 基本不受 BBR 影响。"
+  else
+    red "BBR 未成功启用，当前内核可能不支持 bbr"
+    return 1
+  fi
+}
+
+system_menu(){
+  while true; do
+    clear
+    echo "======================================"
+    echo " 系统优化"
+    echo "======================================"
+    echo "1. 查看 BBR 状态"
+    echo "2. 启用 BBR"
+    echo "0. 返回主菜单"
+    echo "======================================"
+    read -rp "请选择: " s
+
+    case "$s" in
+      1) show_bbr_status; pause ;;
+      2) enable_bbr; pause ;;
+      0) break ;;
+      *) red "无效选择"; pause ;;
+    esac
+  done
+}
+
 update_singbox_image(){
   install_base
 
@@ -623,8 +699,9 @@ menu(){
   echo "12. 停止 sing-box"
   echo "13. 查看日志"
   echo "14. 更新管理"
-  echo "15. 安装/修复快捷命令 sb"
-  echo "16. 卸载"
+  echo "15. 系统优化"
+  echo "16. 安装/修复快捷命令 sb"
+  echo "17. 卸载"
   echo "0. 退出"
   echo "======================================"
   read -rp "请选择: " num
@@ -644,8 +721,9 @@ menu(){
     12) stop_service ;;
     13) logs ;;
     14) update_menu ;;
-    15) install_shortcut ;;
-    16) uninstall ;;
+    15) system_menu ;;
+    16) install_shortcut ;;
+    17) uninstall ;;
     0) exit 0 ;;
     *) red "无效选择" ;;
   esac
