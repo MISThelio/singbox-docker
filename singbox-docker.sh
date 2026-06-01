@@ -133,6 +133,19 @@ tag_exists(){
   jq -e --arg tag "$tag" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null
 }
 
+uri_escape(){
+  jq -rn --arg value "$1" '$value | @uri'
+}
+
+cert_pin_sha256(){
+  local cert_file="$1"
+  openssl x509 -in "$cert_file" -pubkey -noout \
+    | openssl pkey -pubin -outform der \
+    | openssl dgst -sha256 -binary \
+    | openssl enc -base64 \
+    | tr -d '\n'
+}
+
 add_inbound(){
   local inbound_json="$1"
   local tmp
@@ -279,7 +292,7 @@ EOFINFO
 add_hysteria2(){
   install_base
 
-  local port tag password sni cert_dir server_ip inbound
+  local port tag password sni cert_dir server_ip inbound cert_pin cert_pin_uri password_uri tag_uri
   port=$(read_port "监听端口 [默认 8443]: " 8443) || return
 
   if port_used "$port"; then
@@ -310,6 +323,10 @@ add_hysteria2(){
     -subj "/CN=$sni" >/dev/null 2>&1
 
   server_ip=$(public_ip)
+  cert_pin=$(cert_pin_sha256 "$cert_dir/cert.pem")
+  cert_pin_uri=$(uri_escape "$cert_pin")
+  password_uri=$(uri_escape "$password")
+  tag_uri=$(uri_escape "$tag")
 
   inbound=$(cat <<JSON
 {
@@ -344,9 +361,14 @@ JSON
 端口：$port
 密码：$password
 SNI：$sni
-证书：自签证书，客户端需要开启 insecure / allowInsecure
-链接：
-hysteria2://$password@$server_ip:$port?insecure=1&sni=$sni#$tag
+证书：自签证书
+证书 Pin SHA256：$cert_pin
+旧客户端链接（insecure=1）：
+hysteria2://$password_uri@$server_ip:$port?insecure=1&sni=$sni#$tag_uri
+新客户端链接（pinSHA256，适合移除 allowInsecure 的客户端）：
+hysteria2://$password_uri@$server_ip:$port?sni=$sni&pinSHA256=$cert_pin_uri#$tag_uri
+Xray 手动配置字段：
+pinnedPeerCertSha256: $cert_pin
 ==============================
 EOFINFO
 
@@ -457,6 +479,67 @@ show_inbounds(){
   else
     red "未找到配置文件"
   fi
+}
+
+show_hysteria2_links(){
+  if [ ! -f "$CONFIG_FILE" ]; then
+    red "未找到配置文件"
+    return
+  fi
+
+  local count server_ip
+  count=$(jq '[.inbounds[]? | select(.type == "hysteria2")] | length' "$CONFIG_FILE")
+  if [ "$count" -eq 0 ]; then
+    yellow "暂无 Hysteria2 入站"
+    return
+  fi
+
+  server_ip=$(public_ip)
+  jq -c '.inbounds[]? | select(.type == "hysteria2")' "$CONFIG_FILE" | while IFS= read -r inbound; do
+    local tag port password sni cert_path host_cert_path cert_pin cert_pin_uri password_uri tag_uri
+    tag=$(printf '%s' "$inbound" | jq -r '.tag')
+    port=$(printf '%s' "$inbound" | jq -r '.listen_port')
+    password=$(printf '%s' "$inbound" | jq -r '.users[0].password')
+    sni=$(printf '%s' "$inbound" | jq -r '.tls.server_name // empty')
+    cert_path=$(printf '%s' "$inbound" | jq -r '.tls.certificate_path // empty')
+
+    if [ -z "$sni" ]; then
+      sni="bing.com"
+    fi
+
+    case "$cert_path" in
+      /etc/sing-box/*) host_cert_path="$CONFIG_DIR/${cert_path#/etc/sing-box/}" ;;
+      *) host_cert_path="$cert_path" ;;
+    esac
+
+    echo
+    echo "=============================="
+    echo "类型：Hysteria2"
+    echo "标签：$tag"
+    echo "地址：$server_ip"
+    echo "端口：$port"
+    echo "密码：$password"
+    echo "SNI：$sni"
+
+    if [ -f "$host_cert_path" ]; then
+      cert_pin=$(cert_pin_sha256 "$host_cert_path")
+      cert_pin_uri=$(uri_escape "$cert_pin")
+      password_uri=$(uri_escape "$password")
+      tag_uri=$(uri_escape "$tag")
+
+      echo "证书 Pin SHA256：$cert_pin"
+      echo "旧客户端链接（insecure=1）："
+      echo "hysteria2://$password_uri@$server_ip:$port?insecure=1&sni=$sni#$tag_uri"
+      echo "新客户端链接（pinSHA256，适合移除 allowInsecure 的客户端）："
+      echo "hysteria2://$password_uri@$server_ip:$port?sni=$sni&pinSHA256=$cert_pin_uri#$tag_uri"
+      echo "Xray 手动配置字段："
+      echo "pinnedPeerCertSha256: $cert_pin"
+    else
+      red "证书文件不存在，无法生成 pin：$host_cert_path"
+    fi
+
+    echo "=============================="
+  done
 }
 
 logs(){
@@ -691,17 +774,18 @@ menu(){
   echo "4. 添加 Door 转发入站"
   echo "5. 删除入站"
   echo "6. 查看节点信息"
-  echo "7. 查看所有入站"
-  echo "8. 查看完整配置"
-  echo "9. 检查配置"
-  echo "10. 启动 sing-box"
-  echo "11. 重启 sing-box"
-  echo "12. 停止 sing-box"
-  echo "13. 查看日志"
-  echo "14. 更新管理"
-  echo "15. 系统优化"
-  echo "16. 安装/修复快捷命令 sb"
-  echo "17. 卸载"
+  echo "7. 查看 Hysteria2 链接/证书 pin"
+  echo "8. 查看所有入站"
+  echo "9. 查看完整配置"
+  echo "10. 检查配置"
+  echo "11. 启动 sing-box"
+  echo "12. 重启 sing-box"
+  echo "13. 停止 sing-box"
+  echo "14. 查看日志"
+  echo "15. 更新管理"
+  echo "16. 系统优化"
+  echo "17. 安装/修复快捷命令 sb"
+  echo "18. 卸载"
   echo "0. 退出"
   echo "======================================"
   read -rp "请选择: " num
@@ -713,17 +797,18 @@ menu(){
     4) add_door ;;
     5) delete_inbound ;;
     6) show_info ;;
-    7) show_inbounds ;;
-    8) show_config ;;
-    9) check_config ;;
-    10) start_service ;;
-    11) restart_service ;;
-    12) stop_service ;;
-    13) logs ;;
-    14) update_menu ;;
-    15) system_menu ;;
-    16) install_shortcut ;;
-    17) uninstall ;;
+    7) show_hysteria2_links ;;
+    8) show_inbounds ;;
+    9) show_config ;;
+    10) check_config ;;
+    11) start_service ;;
+    12) restart_service ;;
+    13) stop_service ;;
+    14) logs ;;
+    15) update_menu ;;
+    16) system_menu ;;
+    17) install_shortcut ;;
+    18) uninstall ;;
     0) exit 0 ;;
     *) red "无效选择" ;;
   esac
