@@ -137,13 +137,11 @@ uri_escape(){
   jq -rn --arg value "$1" '$value | @uri'
 }
 
-cert_pin_sha256(){
+cert_pin_sha256_hex(){
   local cert_file="$1"
-  openssl x509 -in "$cert_file" -pubkey -noout \
-    | openssl pkey -pubin -outform der \
-    | openssl dgst -sha256 -binary \
-    | openssl enc -base64 \
-    | tr -d '\n'
+  openssl x509 -in "$cert_file" -outform der \
+    | openssl dgst -sha256 -hex \
+    | awk '{print tolower($2)}'
 }
 
 add_inbound(){
@@ -292,7 +290,7 @@ EOFINFO
 add_hysteria2(){
   install_base
 
-  local port tag password sni cert_dir server_ip inbound cert_pin cert_pin_uri password_uri tag_uri
+  local port tag password sni cert_dir server_ip inbound cert_pin_hex password_uri tag_uri
   port=$(read_port "监听端口 [默认 8443]: " 8443) || return
 
   if port_used "$port"; then
@@ -323,8 +321,7 @@ add_hysteria2(){
     -subj "/CN=$sni" >/dev/null 2>&1
 
   server_ip=$(public_ip)
-  cert_pin=$(cert_pin_sha256 "$cert_dir/cert.pem")
-  cert_pin_uri=$(uri_escape "$cert_pin")
+  cert_pin_hex=$(cert_pin_sha256_hex "$cert_dir/cert.pem")
   password_uri=$(uri_escape "$password")
   tag_uri=$(uri_escape "$tag")
 
@@ -362,13 +359,13 @@ JSON
 密码：$password
 SNI：$sni
 证书：自签证书
-证书 Pin SHA256：$cert_pin
+证书 Pin SHA256 Hex：$cert_pin_hex
 旧客户端链接（insecure=1）：
 hysteria2://$password_uri@$server_ip:$port?insecure=1&sni=$sni#$tag_uri
-新客户端链接（pinSHA256，适合移除 allowInsecure 的客户端）：
-hysteria2://$password_uri@$server_ip:$port?sni=$sni&pinSHA256=$cert_pin_uri#$tag_uri
+新客户端链接（pinSHA256 hex，适合移除 allowInsecure 的客户端）：
+hysteria2://$password_uri@$server_ip:$port?sni=$sni&pinSHA256=$cert_pin_hex#$tag_uri
 Xray 手动配置字段：
-pinnedPeerCertSha256: $cert_pin
+pinnedPeerCertSha256: $cert_pin_hex
 ==============================
 EOFINFO
 
@@ -496,7 +493,7 @@ show_hysteria2_links(){
 
   server_ip=$(public_ip)
   jq -c '.inbounds[]? | select(.type == "hysteria2")' "$CONFIG_FILE" | while IFS= read -r inbound; do
-    local tag port password sni cert_path host_cert_path cert_pin cert_pin_uri password_uri tag_uri
+    local tag port password sni cert_path host_cert_path cert_pin_hex password_uri tag_uri
     tag=$(printf '%s' "$inbound" | jq -r '.tag')
     port=$(printf '%s' "$inbound" | jq -r '.listen_port')
     password=$(printf '%s' "$inbound" | jq -r '.users[0].password')
@@ -522,18 +519,17 @@ show_hysteria2_links(){
     echo "SNI：$sni"
 
     if [ -f "$host_cert_path" ]; then
-      cert_pin=$(cert_pin_sha256 "$host_cert_path")
-      cert_pin_uri=$(uri_escape "$cert_pin")
+      cert_pin_hex=$(cert_pin_sha256_hex "$host_cert_path")
       password_uri=$(uri_escape "$password")
       tag_uri=$(uri_escape "$tag")
 
-      echo "证书 Pin SHA256：$cert_pin"
+      echo "证书 Pin SHA256 Hex：$cert_pin_hex"
       echo "旧客户端链接（insecure=1）："
       echo "hysteria2://$password_uri@$server_ip:$port?insecure=1&sni=$sni#$tag_uri"
-      echo "新客户端链接（pinSHA256，适合移除 allowInsecure 的客户端）："
-      echo "hysteria2://$password_uri@$server_ip:$port?sni=$sni&pinSHA256=$cert_pin_uri#$tag_uri"
+      echo "新客户端链接（pinSHA256 hex，适合移除 allowInsecure 的客户端）："
+      echo "hysteria2://$password_uri@$server_ip:$port?sni=$sni&pinSHA256=$cert_pin_hex#$tag_uri"
       echo "Xray 手动配置字段："
-      echo "pinnedPeerCertSha256: $cert_pin"
+      echo "pinnedPeerCertSha256: $cert_pin_hex"
     else
       red "证书文件不存在，无法生成 pin：$host_cert_path"
     fi
