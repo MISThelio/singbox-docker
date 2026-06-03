@@ -144,6 +144,79 @@ cert_pin_sha256_hex(){
     | awk '{print tolower($2)}'
 }
 
+cert_is_self_signed(){
+  local cert_file="$1"
+  local subject issuer
+  subject=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed 's/^subject=//')
+  issuer=$(openssl x509 -in "$cert_file" -noout -issuer 2>/dev/null | sed 's/^issuer=//')
+  [ -n "$subject" ] && [ "$subject" = "$issuer" ]
+}
+
+install_certbot(){
+  if command -v certbot >/dev/null 2>&1; then
+    return
+  fi
+
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    apt-get install -y certbot
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y certbot
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y certbot
+  else
+    red "暂不支持当前系统包管理器自动安装 certbot"
+    exit 1
+  fi
+}
+
+issue_letsencrypt_cert(){
+  local domain="$1"
+  local email="$2"
+  local tag="$3"
+  local cert_dir="$4"
+  local renew_hook="/etc/letsencrypt/renewal-hooks/deploy/singbox-docker-$tag.sh"
+
+  install_certbot
+
+  yellow "即将通过 Let's Encrypt HTTP-01 申请证书，请确保："
+  yellow "1. 域名 $domain 已解析到本服务器"
+  yellow "2. 服务器 80/tcp 已放行且未被其他服务占用"
+  yellow "3. 云服务器安全组已放行 80/tcp"
+
+  if port_used 80; then
+    red "80 端口已被占用，certbot standalone 无法申请证书"
+    return 1
+  fi
+
+  if [ -n "$email" ]; then
+    certbot certonly --standalone --non-interactive --agree-tos \
+      --preferred-challenges http -m "$email" -d "$domain"
+  else
+    certbot certonly --standalone --non-interactive --agree-tos \
+      --register-unsafely-without-email --preferred-challenges http -d "$domain"
+  fi
+
+  mkdir -p "$cert_dir"
+  cp "/etc/letsencrypt/live/$domain/fullchain.pem" "$cert_dir/cert.pem"
+  cp "/etc/letsencrypt/live/$domain/privkey.pem" "$cert_dir/private.key"
+  chmod 600 "$cert_dir/private.key"
+
+  mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+  cat > "$renew_hook" <<EOFHOOK
+#!/usr/bin/env bash
+set -e
+if [ "\$RENEWED_LINEAGE" = "/etc/letsencrypt/live/$domain" ]; then
+  cp "\$RENEWED_LINEAGE/fullchain.pem" "$cert_dir/cert.pem"
+  cp "\$RENEWED_LINEAGE/privkey.pem" "$cert_dir/private.key"
+  chmod 600 "$cert_dir/private.key"
+  cd "$WORK_DIR"
+  docker compose up -d --force-recreate
+fi
+EOFHOOK
+  chmod +x "$renew_hook"
+}
+
 add_inbound(){
   local inbound_json="$1"
   local tmp
@@ -290,7 +363,7 @@ EOFINFO
 add_hysteria2(){
   install_base
 
-  local port tag password sni cert_dir server_ip inbound cert_pin_hex password_uri tag_uri
+  local port tag password sni cert_dir server_ip inbound cert_pin_hex password_uri tag_uri cert_mode cert_note link_host email
   port=$(read_port "监听端口 [默认 8443]: " 8443) || return
 
   if port_used "$port"; then
@@ -308,17 +381,40 @@ add_hysteria2(){
   read -rp "密码 [留空自动生成]: " password
   password=${password:-$(openssl rand -hex 16)}
 
-  read -rp "SNI/证书域名 [默认 bing.com]: " sni
-  sni=${sni:-bing.com}
-
   cert_dir="$CONFIG_DIR/cert-$tag"
   mkdir -p "$cert_dir"
 
-  openssl req -x509 -newkey rsa:2048 -nodes \
-    -keyout "$cert_dir/private.key" \
-    -out "$cert_dir/cert.pem" \
-    -days 3650 \
-    -subj "/CN=$sni" >/dev/null 2>&1
+  echo "证书模式："
+  echo "1. 自签证书（默认，客户端需 insecure 或 pinSHA256）"
+  echo "2. Let's Encrypt 真实证书（推荐，需域名解析到本机并放行 80/tcp）"
+  read -rp "请选择 [默认 1]: " cert_mode
+  cert_mode=${cert_mode:-1}
+
+  case "$cert_mode" in
+    1)
+      read -rp "SNI/证书域名 [默认 bing.com]: " sni
+      sni=${sni:-bing.com}
+      openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout "$cert_dir/private.key" \
+        -out "$cert_dir/cert.pem" \
+        -days 3650 \
+        -subj "/CN=$sni" >/dev/null 2>&1
+      cert_note="自签证书"
+      link_host="$(public_ip)"
+      ;;
+    2)
+      read -rp "证书域名，例如 hy2.example.com: " sni
+      [ -n "$sni" ] || { red "证书域名不能为空"; return; }
+      read -rp "Let's Encrypt 邮箱 [可留空]: " email
+      issue_letsencrypt_cert "$sni" "$email" "$tag" "$cert_dir" || return
+      cert_note="Let's Encrypt 真实证书"
+      link_host="$sni"
+      ;;
+    *)
+      red "证书模式只能选择 1 或 2"
+      return
+      ;;
+  esac
 
   server_ip=$(public_ip)
   cert_pin_hex=$(cert_pin_sha256_hex "$cert_dir/cert.pem")
@@ -358,12 +454,14 @@ JSON
 端口：$port
 密码：$password
 SNI：$sni
-证书：自签证书
+证书：$cert_note
 证书 Pin SHA256 Hex：$cert_pin_hex
 旧客户端链接（insecure=1）：
-hysteria2://$password_uri@$server_ip:$port?insecure=1&sni=$sni#$tag_uri
+hysteria2://$password_uri@$link_host:$port?insecure=1&sni=$sni#$tag_uri
 新客户端链接（pinSHA256 hex，适合移除 allowInsecure 的客户端）：
-hysteria2://$password_uri@$server_ip:$port?sni=$sni&pinSHA256=$cert_pin_hex#$tag_uri
+hysteria2://$password_uri@$link_host:$port?sni=$sni&pinSHA256=$cert_pin_hex#$tag_uri
+真实证书标准链接（Let's Encrypt 模式优先使用）：
+hysteria2://$password_uri@$link_host:$port?sni=$sni#$tag_uri
 Xray 手动配置字段：
 pinnedPeerCertSha256: $cert_pin_hex
 ==============================
@@ -524,12 +622,22 @@ show_hysteria2_links(){
       tag_uri=$(uri_escape "$tag")
 
       echo "证书 Pin SHA256 Hex：$cert_pin_hex"
-      echo "旧客户端链接（insecure=1）："
-      echo "hysteria2://$password_uri@$server_ip:$port?insecure=1&sni=$sni#$tag_uri"
-      echo "新客户端链接（pinSHA256 hex，适合移除 allowInsecure 的客户端）："
-      echo "hysteria2://$password_uri@$server_ip:$port?sni=$sni&pinSHA256=$cert_pin_hex#$tag_uri"
-      echo "Xray 手动配置字段："
-      echo "pinnedPeerCertSha256: $cert_pin_hex"
+
+      if cert_is_self_signed "$host_cert_path"; then
+        echo "证书类型：自签证书"
+        echo "旧客户端链接（insecure=1）："
+        echo "hysteria2://$password_uri@$server_ip:$port?insecure=1&sni=$sni#$tag_uri"
+        echo "新客户端链接（pinSHA256 hex，适合移除 allowInsecure 的客户端）："
+        echo "hysteria2://$password_uri@$server_ip:$port?sni=$sni&pinSHA256=$cert_pin_hex#$tag_uri"
+        echo "Xray 手动配置字段："
+        echo "pinnedPeerCertSha256: $cert_pin_hex"
+      else
+        echo "证书类型：真实证书"
+        echo "标准链接（推荐）："
+        echo "hysteria2://$password_uri@$sni:$port?sni=$sni#$tag_uri"
+        echo "兼容 pinSHA256 链接："
+        echo "hysteria2://$password_uri@$sni:$port?sni=$sni&pinSHA256=$cert_pin_hex#$tag_uri"
+      fi
     else
       red "证书文件不存在，无法生成 pin：$host_cert_path"
     fi
