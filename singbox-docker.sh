@@ -709,7 +709,44 @@ delete_inbound(){
 }
 
 show_info(){
-  [ -f "$INFO_FILE" ] && cat "$INFO_FILE" || yellow "暂无节点信息"
+  if [ ! -f "$CONFIG_FILE" ]; then
+    red "未找到配置文件"
+    return
+  fi
+
+  if [ ! -f "$INFO_FILE" ]; then
+    yellow "暂无节点信息"
+    return
+  fi
+
+  local tags
+  tags=$(jq -r '.inbounds[]?.tag' "$CONFIG_FILE" | awk 'BEGIN{printf "|"} {printf "%s|",$0}')
+  if [ "$tags" = "|" ]; then
+    yellow "当前没有入站节点"
+    return
+  fi
+
+  awk -v tags="$tags" '
+    BEGIN { RS="=============================="; shown=0 }
+    {
+      keep=0
+      n=split($0, lines, "\n")
+      for (i=1; i<=n; i++) {
+        if (lines[i] ~ /^标签：/) {
+          tag=lines[i]
+          sub(/^标签：/, "", tag)
+          if (index(tags, "|" tag "|") > 0) keep=1
+        }
+      }
+      if (keep) {
+        print "==============================" $0 "=============================="
+        shown=1
+      }
+    }
+    END {
+      if (!shown) print "暂无可展示的节点链接信息；可在协议专用菜单中查看当前入站配置。"
+    }
+  ' "$INFO_FILE"
 }
 
 show_config(){
@@ -869,6 +906,60 @@ show_anytls_links(){
 }
 EOFANYTLS
     echo "=============================="
+  done
+}
+
+add_config_menu(){
+  while true; do
+    clear
+    echo "======================================"
+    echo " 添加配置"
+    echo "======================================"
+    echo "1. 添加 VLESS Reality 入站"
+    echo "2. 添加 Hysteria2 入站"
+    echo "3. 添加 AnyTLS 入站"
+    echo "4. 添加 Door 转发入站"
+    echo "0. 返回主菜单"
+    echo "======================================"
+    read -rp "请选择: " a
+
+    case "$a" in
+      1) add_reality; pause ;;
+      2) add_hysteria2; pause ;;
+      3) add_anytls; pause ;;
+      4) add_door; pause ;;
+      0) break ;;
+      *) red "无效选择"; pause ;;
+    esac
+  done
+}
+
+config_menu(){
+  while true; do
+    clear
+    echo "======================================"
+    echo " 配置查看 / 检查"
+    echo "======================================"
+    echo "1. 查看节点信息（仅当前存在的入站）"
+    echo "2. 查看 Hysteria2 链接/证书 pin"
+    echo "3. 查看 AnyTLS 链接/配置"
+    echo "4. 查看所有入站摘要"
+    echo "5. 查看完整 config.json"
+    echo "6. 检查配置"
+    echo "0. 返回主菜单"
+    echo "======================================"
+    read -rp "请选择: " c
+
+    case "$c" in
+      1) show_info; pause ;;
+      2) show_hysteria2_links; pause ;;
+      3) show_anytls_links; pause ;;
+      4) show_inbounds; pause ;;
+      5) show_config; pause ;;
+      6) check_config; pause ;;
+      0) break ;;
+      *) red "无效选择"; pause ;;
+    esac
   done
 }
 
@@ -1119,50 +1210,34 @@ menu(){
   echo " 镜像：$SING_BOX_IMAGE"
   echo "======================================"
   echo "1. 初始化 sing-box Docker"
-  echo "2. 添加 VLESS Reality 入站"
-  echo "3. 添加 Hysteria2 入站"
-  echo "4. 添加 AnyTLS 入站"
-  echo "5. 添加 Door 转发入站"
-  echo "6. 删除入站"
-  echo "7. 查看节点信息"
-  echo "8. 查看 Hysteria2 链接/证书 pin"
-  echo "9. 查看 AnyTLS 链接/配置"
-  echo "10. 查看所有入站"
-  echo "11. 查看完整配置"
-  echo "12. 检查配置"
-  echo "13. 启动 sing-box"
-  echo "14. 重启 sing-box"
-  echo "15. 停止 sing-box"
-  echo "16. 查看日志"
-  echo "17. 更新管理"
-  echo "18. 系统优化"
-  echo "19. 安装/修复快捷命令 sb"
-  echo "20. 卸载"
+  echo "2. 添加配置"
+  echo "3. 删除入站"
+  echo "4. 配置查看 / 检查"
+  echo "5. 启动 sing-box"
+  echo "6. 重启 sing-box"
+  echo "7. 停止 sing-box"
+  echo "8. 查看日志"
+  echo "9. 更新管理"
+  echo "10. 系统优化"
+  echo "11. 安装/修复快捷命令 sb"
+  echo "12. 卸载"
   echo "0. 退出"
   echo "======================================"
   read -rp "请选择: " num
 
   case "$num" in
     1) install_base; start_service ;;
-    2) add_reality ;;
-    3) add_hysteria2 ;;
-    4) add_anytls ;;
-    5) add_door ;;
-    6) delete_inbound ;;
-    7) show_info ;;
-    8) show_hysteria2_links ;;
-    9) show_anytls_links ;;
-    10) show_inbounds ;;
-    11) show_config ;;
-    12) check_config ;;
-    13) start_service ;;
-    14) restart_service ;;
-    15) stop_service ;;
-    16) logs ;;
-    17) update_menu ;;
-    18) system_menu ;;
-    19) install_shortcut ;;
-    20) uninstall ;;
+    2) add_config_menu ;;
+    3) delete_inbound ;;
+    4) config_menu ;;
+    5) start_service ;;
+    6) restart_service ;;
+    7) stop_service ;;
+    8) logs ;;
+    9) update_menu ;;
+    10) system_menu ;;
+    11) install_shortcut ;;
+    12) uninstall ;;
     0) exit 0 ;;
     *) red "无效选择" ;;
   esac
