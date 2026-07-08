@@ -11,7 +11,7 @@ INFO_FILE="$WORK_DIR/nodes.txt"
 COMPOSE_FILE="$WORK_DIR/docker-compose.yml"
 BACKUP_DIR="$WORK_DIR/backup"
 SCRIPT_PATH="${SCRIPT_PATH:-/usr/local/bin/sb}"
-SCRIPT_URL="${SCRIPT_URL:-}"
+SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/MISThelio/singbox-docker/main/singbox-docker.sh}"
 
 green(){ printf '\033[32m%s\033[0m\n' "$1"; }
 yellow(){ printf '\033[33m%s\033[0m\n' "$1"; }
@@ -1013,7 +1013,25 @@ update_singbox_image(){
   sync_compose_image
 
   yellow "拉取 sing-box 镜像：$SING_BOX_IMAGE"
-  docker compose pull
+  local pull_log
+  pull_log=$(mktemp)
+  if ! docker compose pull 2>&1 | tee "$pull_log"; then
+    if grep -qi 'denied' "$pull_log" && printf '%s' "$SING_BOX_IMAGE" | grep -q '^ghcr\.io/'; then
+      red "GHCR 返回 denied，常见原因是 Docker 保存了失效的 ghcr.io 登录凭据。"
+      read -rp "是否执行 docker logout ghcr.io 后重试？输入 y: " retry_ghcr
+      if [ "$retry_ghcr" = "y" ]; then
+        docker logout ghcr.io || true
+        docker compose pull
+      else
+        rm -f "$pull_log"
+        return 1
+      fi
+    else
+      rm -f "$pull_log"
+      return 1
+    fi
+  fi
+  rm -f "$pull_log"
 
   yellow "使用目标镜像检查配置..."
   check_config
