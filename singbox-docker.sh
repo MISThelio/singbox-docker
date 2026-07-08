@@ -1084,6 +1084,7 @@ system_menu(){
     echo "======================================"
     echo "1. 查看 BBR 状态"
     echo "2. 启用 BBR"
+    echo "3. 初始化/修复 sing-box Docker 环境"
     echo "0. 返回主菜单"
     echo "======================================"
     read -rp "请选择: " s
@@ -1091,6 +1092,7 @@ system_menu(){
     case "$s" in
       1) show_bbr_status; pause ;;
       2) enable_bbr; pause ;;
+      3) install_base; start_service; pause ;;
       0) break ;;
       *) red "无效选择"; pause ;;
     esac
@@ -1248,35 +1250,33 @@ menu(){
   echo " sing-box Docker 多入站管理脚本"
   echo " 镜像：$SING_BOX_IMAGE"
   echo "======================================"
-  echo "1. 初始化 sing-box Docker"
-  echo "2. 添加配置"
-  echo "3. 删除入站"
-  echo "4. 配置查看 / 检查"
-  echo "5. 启动 sing-box"
-  echo "6. 重启 sing-box"
-  echo "7. 停止 sing-box"
-  echo "8. 查看日志"
-  echo "9. 更新管理"
-  echo "10. 系统优化"
-  echo "11. 安装/修复快捷命令 sb"
-  echo "12. 卸载"
+  echo "1. 添加配置"
+  echo "2. 删除入站"
+  echo "3. 配置查看 / 检查"
+  echo "4. 启动 sing-box"
+  echo "5. 重启 sing-box"
+  echo "6. 停止 sing-box"
+  echo "7. 查看日志"
+  echo "8. 更新管理"
+  echo "9. 系统优化"
+  echo "10. 安装/修复快捷命令 sb"
+  echo "11. 卸载"
   echo "0. 退出"
   echo "======================================"
   read -rp "请选择: " num
 
   case "$num" in
-    1) install_base; start_service ;;
-    2) add_config_menu ;;
-    3) delete_inbound ;;
-    4) config_menu ;;
-    5) start_service ;;
-    6) restart_service ;;
-    7) stop_service ;;
-    8) logs ;;
-    9) update_menu ;;
-    10) system_menu ;;
-    11) install_shortcut ;;
-    12) uninstall ;;
+    1) add_config_menu ;;
+    2) delete_inbound ;;
+    3) config_menu ;;
+    4) start_service ;;
+    5) restart_service ;;
+    6) stop_service ;;
+    7) logs ;;
+    8) update_menu ;;
+    9) system_menu ;;
+    10) install_shortcut ;;
+    11) uninstall ;;
     0) exit 0 ;;
     *) red "无效选择" ;;
   esac
