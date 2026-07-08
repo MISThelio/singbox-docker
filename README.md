@@ -2,6 +2,8 @@
 
 Docker 版 sing-box 多入站管理脚本。核心运行使用 SagerNet 官方 sing-box 镜像，交互管理思路参考 233boy/sing-box 的一键脚本体验。
 
+> 仅供学习、测试和合法网络管理用途。使用者需要自行遵守所在地法律、云厂商规则和上游项目许可证。
+
 ## 功能
 
 - 初始化 Docker / Docker Compose 运行环境
@@ -16,6 +18,15 @@ Docker 版 sing-box 多入站管理脚本。核心运行使用 SagerNet 官方 s
 - 支持通过 `SING_BOX_IMAGE` 或 `SING_BOX_VERSION` 覆盖镜像
 
 ## 快速使用
+
+一键安装：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MISThelio/singbox-docker/main/install.sh -o install.sh
+sudo SCRIPT_URL=https://raw.githubusercontent.com/MISThelio/singbox-docker/main/singbox-docker.sh bash install.sh
+```
+
+从源码目录安装：
 
 ```bash
 cd singbox-docker
@@ -34,6 +45,24 @@ sudo sb
 ```bash
 sudo SCRIPT_URL=https://raw.githubusercontent.com/MISThelio/singbox-docker/main/singbox-docker.sh ./install.sh
 ```
+
+## 菜单结构
+
+```text
+1. 添加配置
+2. 删除入站
+3. 配置查看 / 检查
+4. 启动 sing-box
+5. 重启 sing-box
+6. 停止 sing-box
+7. 查看日志
+8. 更新管理
+9. 系统优化
+10. 安装/修复快捷命令 sb
+11. 卸载
+```
+
+`初始化/修复 sing-box Docker 环境` 位于 `系统优化` 子菜单中。添加入站、删除入站、更新镜像等操作会按需初始化基础环境。
 
 ## 目录
 
@@ -85,6 +114,7 @@ AnyTLS 从 sing-box `1.12.0` 开始支持。本脚本会生成 AnyTLS 入站配�
 
 ## 注意
 
+- 脚本需要 root 权限运行，会安装依赖、安装或启用 Docker，并写入 `/opt/sing-box`。
 - VLESS Reality 通常只需要放行 TCP 端口。
 - Hysteria2 需要放行 UDP 端口，脚本也会提示 TCP/UDP 安全组。
 - AnyTLS 需要放行 TCP 端口。
@@ -94,9 +124,26 @@ AnyTLS 从 sing-box `1.12.0` 开始支持。本脚本会生成 AnyTLS 入站配�
 - 如果使用云服务器，请同时检查系统防火墙和云厂商安全组。
 - 脚本不会覆盖已存在的 `/opt/sing-box/docker-compose.yml`，避免误覆盖用户修改。
 
+## 安全提示
+
+- 不要公开 `/opt/sing-box/config/config.json`、`/opt/sing-box/nodes.txt`、证书目录或完整节点链接。
+- 节点链接里的 UUID、密码、Reality key、证书 pin 都应视为敏感信息。
+- 提交 issue 或日志时请先打码服务器 IP、域名、密码、UUID 和私钥。
+- Hysteria2 自签证书建议使用 `pinSHA256`；长期使用 `insecure/allowInsecure` 风险更高，且部分客户端会逐步移除相关兼容。
+
+## 免责声明
+
+本项目不提供任何网络服务，也不内置任何可用节点。脚本只负责在用户自己的服务器上生成和管理 sing-box 配置。
+
+运行脚本可能修改系统环境、安装软件包、启动 Docker 容器、开放监听端口、生成证书或调整内核参数。请在理解脚本行为后使用。因使用、修改、分发本项目导致的账号、服务器、网络、数据或合规风险，由使用者自行承担。
+
+## 许可证
+
+本项目使用 GPL-3.0 许可证发布，详见 [LICENSE](LICENSE)。
+
 ## 上游
 
 - https://github.com/SagerNet/sing-box
 - https://github.com/233boy/sing-box
 
-使用或分发时请遵守上游项目许可证要求。
+使用或分发时请同时遵守上游项目许可证要求。上游来源说明见 [NOTICE](NOTICE)。

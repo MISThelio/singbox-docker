@@ -1,0 +1,15 @@
+singbox-docker
+
+This project provides a Docker-oriented management script for sing-box.
+
+Upstream projects and references:
+
+- SagerNet/sing-box: https://github.com/SagerNet/sing-box
+- 233boy/sing-box: https://github.com/233boy/sing-box
+
+The runtime uses the official SagerNet sing-box container image by default.
+The interactive management flow is inspired by the one-click script style of
+233boy/sing-box.
+
+Users and distributors must comply with the licenses of the upstream projects
+and any third-party software installed or invoked by this script.

@@ -1,0 +1,17 @@
+# Runtime data and generated secrets
+/config/
+/data/
+/backup/
+/nodes.txt
+/docker-compose.override.yml
+
+# Local editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
