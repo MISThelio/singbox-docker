@@ -11,7 +11,8 @@ INFO_FILE="$WORK_DIR/nodes.txt"
 COMPOSE_FILE="$WORK_DIR/docker-compose.yml"
 BACKUP_DIR="$WORK_DIR/backup"
 SCRIPT_PATH="${SCRIPT_PATH:-/usr/local/bin/sb}"
-SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/MISThelio/singbox-docker/main/singbox-docker.sh}"
+SCRIPT_URL="${SCRIPT_URL:-https://api.github.com/repos/MISThelio/singbox-docker/contents/singbox-docker.sh?ref=main}"
+SCRIPT_ACCEPT="${SCRIPT_ACCEPT:-application/vnd.github.raw}"
 
 green(){ printf '\033[32m%s\033[0m\n' "$1"; }
 yellow(){ printf '\033[33m%s\033[0m\n' "$1"; }
@@ -1056,7 +1057,7 @@ update_script(){
   cp "$SCRIPT_PATH" "$SCRIPT_PATH.bak.$(date +%Y%m%d-%H%M%S)"
 
   yellow "下载新脚本..."
-  curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_PATH.tmp"
+  curl -fsSL -H "Accept: $SCRIPT_ACCEPT" -H "Cache-Control: no-cache" "$SCRIPT_URL" -o "$SCRIPT_PATH.tmp"
 
   if bash -n "$SCRIPT_PATH.tmp"; then
     mv "$SCRIPT_PATH.tmp" "$SCRIPT_PATH"
