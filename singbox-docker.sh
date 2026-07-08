@@ -114,6 +114,25 @@ services:
 YAML
 }
 
+sync_compose_image(){
+  if [ ! -f "$COMPOSE_FILE" ]; then
+    write_compose_file
+    return
+  fi
+
+  local tmp
+  tmp=$(mktemp)
+
+  if grep -qE '^[[:space:]]*image:[[:space:]]+ghcr\.io/sagernet/sing-box:' "$COMPOSE_FILE"; then
+    sed -E "s#^([[:space:]]*image:[[:space:]]+)ghcr\.io/sagernet/sing-box:[^[:space:]]+#\1${SING_BOX_IMAGE}#" "$COMPOSE_FILE" > "$tmp"
+    mv "$tmp" "$COMPOSE_FILE"
+    green "docker-compose.yml 镜像已同步为：$SING_BOX_IMAGE"
+  else
+    rm -f "$tmp"
+    yellow "未在 docker-compose.yml 中找到官方 sing-box 镜像行，跳过自动修改"
+  fi
+}
+
 install_base(){
   install_packages
   install_docker
@@ -991,6 +1010,8 @@ update_singbox_image(){
   backup_config
 
   cd "$WORK_DIR"
+  sync_compose_image
+
   yellow "拉取 sing-box 镜像：$SING_BOX_IMAGE"
   docker compose pull
 
