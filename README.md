@@ -5,7 +5,7 @@ Docker 版 sing-box 多入站管理脚本。核心运行使用 SagerNet 官方 s
 ## 功能
 
 - 初始化 Docker / Docker Compose 运行环境
-- 使用固定版本镜像，默认 `ghcr.io/sagernet/sing-box:v1.13.14`
+- 使用官方稳定最新版镜像，默认 `ghcr.io/sagernet/sing-box:latest`
 - 添加 VLESS Reality 入站
 - 添加 Hysteria2 入站，支持自签证书或 Let's Encrypt 真实证书
 - 添加 AnyTLS 入站，支持自签证书或 Let's Encrypt 真实证书
@@ -65,6 +65,8 @@ sudo SING_BOX_IMAGE=ghcr.io/sagernet/sing-box:v1.13.14 ./singbox-docker.sh
 docker build --build-arg SING_BOX_VERSION=v1.13.14 -t local/sing-box:v1.13.14 .
 sudo SING_BOX_IMAGE=local/sing-box:v1.13.14 ./singbox-docker.sh
 ```
+
+运行镜像默认使用 `latest` 稳定标签，方便菜单里的镜像更新自动跟随官方稳定版；源码构建仍需要指定真实 release tag。
 
 ## Hysteria2 证书
 

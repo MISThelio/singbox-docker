@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SING_BOX_VERSION="${SING_BOX_VERSION:-v1.13.14}"
+SING_BOX_VERSION="${SING_BOX_VERSION:-latest}"
 SING_BOX_IMAGE="${SING_BOX_IMAGE:-ghcr.io/sagernet/sing-box:${SING_BOX_VERSION}}"
 WORK_DIR="${WORK_DIR:-/opt/sing-box}"
 CONFIG_DIR="$WORK_DIR/config"
