@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SING_BOX_VERSION="${SING_BOX_VERSION:-v1.13.12}"
+SING_BOX_VERSION="${SING_BOX_VERSION:-v1.13.14}"
 SING_BOX_IMAGE="${SING_BOX_IMAGE:-ghcr.io/sagernet/sing-box:${SING_BOX_VERSION}}"
 WORK_DIR="${WORK_DIR:-/opt/sing-box}"
 CONFIG_DIR="$WORK_DIR/config"
@@ -47,8 +47,14 @@ install_packages(){
     dnf install -y curl wget openssl jq util-linux ca-certificates iproute
   elif command -v yum >/dev/null 2>&1; then
     yum install -y curl wget openssl jq util-linux ca-certificates iproute
+  elif command -v zypper >/dev/null 2>&1; then
+    zypper --non-interactive refresh
+    zypper --non-interactive install curl wget openssl jq util-linux ca-certificates iproute2
+  elif command -v apk >/dev/null 2>&1; then
+    apk update
+    apk add --no-cache bash curl wget openssl jq util-linux ca-certificates iproute2 gcompat
   else
-    red "暂不支持当前系统包管理器，请手动安装 curl/wget/openssl/jq/uuidgen/iproute2"
+    red "暂不支持当前系统包管理器，请手动安装 bash/curl/wget/openssl/jq/uuidgen/iproute2"
     exit 1
   fi
 }
@@ -474,6 +480,128 @@ EOFINFO
   green "Hysteria2 入站已添加"
 }
 
+add_anytls(){
+  install_base
+
+  local port tag password sni cert_dir server_ip inbound cert_pin_hex password_uri tag_uri cert_mode cert_note link_host email
+  port=$(read_port "监听端口 [默认 8444]: " 8444) || return
+
+  if port_used "$port"; then
+    red "端口 $port 可能已被占用，请换一个端口"
+    return
+  fi
+
+  read -rp "节点标签 [默认 anytls-$port]: " tag
+  tag=${tag:-anytls-$port}
+  if tag_exists "$tag"; then
+    red "标签 $tag 已存在，请换一个标签"
+    return
+  fi
+
+  read -rp "密码 [留空自动生成]: " password
+  password=${password:-$(openssl rand -base64 18)}
+
+  cert_dir="$CONFIG_DIR/cert-$tag"
+  mkdir -p "$cert_dir"
+
+  echo "证书模式："
+  echo "1. 自签证书（默认，客户端需 insecure 或 pinSHA256）"
+  echo "2. Let's Encrypt 真实证书（推荐，需域名解析到本机并放行 80/tcp）"
+  read -rp "请选择 [默认 1]: " cert_mode
+  cert_mode=${cert_mode:-1}
+
+  case "$cert_mode" in
+    1)
+      read -rp "SNI/证书域名 [默认 www.microsoft.com]: " sni
+      sni=${sni:-www.microsoft.com}
+      openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout "$cert_dir/private.key" \
+        -out "$cert_dir/cert.pem" \
+        -days 3650 \
+        -subj "/CN=$sni" >/dev/null 2>&1
+      cert_note="自签证书"
+      link_host="$(public_ip)"
+      ;;
+    2)
+      read -rp "证书域名，例如 anytls.example.com: " sni
+      [ -n "$sni" ] || { red "证书域名不能为空"; return; }
+      read -rp "Let's Encrypt 邮箱 [可留空]: " email
+      issue_letsencrypt_cert "$sni" "$email" "$tag" "$cert_dir" || return
+      cert_note="Let's Encrypt 真实证书"
+      link_host="$sni"
+      ;;
+    *)
+      red "证书模式只能选择 1 或 2"
+      return
+      ;;
+  esac
+
+  server_ip=$(public_ip)
+  cert_pin_hex=$(cert_pin_sha256_hex "$cert_dir/cert.pem")
+  password_uri=$(uri_escape "$password")
+  tag_uri=$(uri_escape "$tag")
+
+  inbound=$(cat <<JSON
+{
+  "type": "anytls",
+  "tag": "$tag",
+  "listen": "::",
+  "listen_port": $port,
+  "users": [
+    {
+      "name": "$tag",
+      "password": "$password"
+    }
+  ],
+  "tls": {
+    "enabled": true,
+    "server_name": "$sni",
+    "certificate_path": "/etc/sing-box/cert-$tag/cert.pem",
+    "key_path": "/etc/sing-box/cert-$tag/private.key"
+  }
+}
+JSON
+)
+
+  add_inbound "$inbound"
+
+  cat >> "$INFO_FILE" <<EOFINFO
+
+==============================
+类型：AnyTLS
+标签：$tag
+地址：$server_ip
+推荐地址：$link_host
+端口：$port
+密码：$password
+SNI：$sni
+证书：$cert_note
+证书 Pin SHA256 Hex：$cert_pin_hex
+AnyTLS URI（客户端支持时可尝试）：
+anytls://$password_uri@$link_host:$port?sni=$sni#$tag_uri
+sing-box 客户端出站配置：
+{
+  "type": "anytls",
+  "tag": "$tag",
+  "server": "$link_host",
+  "server_port": $port,
+  "password": "$password",
+  "tls": {
+    "enabled": true,
+    "server_name": "$sni"
+  }
+}
+自签证书客户端提示：
+如使用自签证书，客户端需要开启 insecure 或填写证书 pin：$cert_pin_hex
+==============================
+EOFINFO
+
+  check_config
+  restart_service
+  open_port "$port" tcp
+  green "AnyTLS 入站已添加"
+}
+
 add_door(){
   install_base
 
@@ -642,6 +770,84 @@ show_hysteria2_links(){
       red "证书文件不存在，无法生成 pin：$host_cert_path"
     fi
 
+    echo "=============================="
+  done
+}
+
+show_anytls_links(){
+  if [ ! -f "$CONFIG_FILE" ]; then
+    red "未找到配置文件"
+    return
+  fi
+
+  local count server_ip
+  count=$(jq '[.inbounds[]? | select(.type == "anytls")] | length' "$CONFIG_FILE")
+  if [ "$count" -eq 0 ]; then
+    yellow "暂无 AnyTLS 入站"
+    return
+  fi
+
+  server_ip=$(public_ip)
+  jq -c '.inbounds[]? | select(.type == "anytls")' "$CONFIG_FILE" | while IFS= read -r inbound; do
+    local tag port password sni cert_path host_cert_path cert_pin_hex password_uri tag_uri link_host
+    tag=$(printf '%s' "$inbound" | jq -r '.tag')
+    port=$(printf '%s' "$inbound" | jq -r '.listen_port')
+    password=$(printf '%s' "$inbound" | jq -r '.users[0].password')
+    sni=$(printf '%s' "$inbound" | jq -r '.tls.server_name // empty')
+    cert_path=$(printf '%s' "$inbound" | jq -r '.tls.certificate_path // empty')
+
+    [ -n "$sni" ] || sni="www.microsoft.com"
+    case "$cert_path" in
+      /etc/sing-box/*) host_cert_path="$CONFIG_DIR/${cert_path#/etc/sing-box/}" ;;
+      *) host_cert_path="$cert_path" ;;
+    esac
+
+    if [ -f "$host_cert_path" ] && ! cert_is_self_signed "$host_cert_path"; then
+      link_host="$sni"
+    else
+      link_host="$server_ip"
+    fi
+
+    password_uri=$(uri_escape "$password")
+    tag_uri=$(uri_escape "$tag")
+
+    echo
+    echo "=============================="
+    echo "类型：AnyTLS"
+    echo "标签：$tag"
+    echo "地址：$server_ip"
+    echo "推荐地址：$link_host"
+    echo "端口：$port"
+    echo "密码：$password"
+    echo "SNI：$sni"
+    echo "AnyTLS URI（客户端支持时可尝试）："
+    echo "anytls://$password_uri@$link_host:$port?sni=$sni#$tag_uri"
+
+    if [ -f "$host_cert_path" ]; then
+      cert_pin_hex=$(cert_pin_sha256_hex "$host_cert_path")
+      if cert_is_self_signed "$host_cert_path"; then
+        echo "证书类型：自签证书"
+        echo "证书 Pin SHA256 Hex：$cert_pin_hex"
+        echo "自签证书客户端提示：开启 insecure 或填写证书 pin。"
+      else
+        echo "证书类型：真实证书"
+      fi
+    fi
+
+    echo "sing-box 客户端出站配置："
+    cat <<EOFANYTLS
+{
+  "type": "anytls",
+  "tag": "$tag",
+  "server": "$link_host",
+  "server_port": $port,
+  "password": "$password",
+  "tls": {
+    "enabled": true,
+    "server_name": "$sni"
+  }
+}
+EOFANYTLS
     echo "=============================="
   done
 }
@@ -875,21 +1081,23 @@ menu(){
   echo "1. 初始化 sing-box Docker"
   echo "2. 添加 VLESS Reality 入站"
   echo "3. 添加 Hysteria2 入站"
-  echo "4. 添加 Door 转发入站"
-  echo "5. 删除入站"
-  echo "6. 查看节点信息"
-  echo "7. 查看 Hysteria2 链接/证书 pin"
-  echo "8. 查看所有入站"
-  echo "9. 查看完整配置"
-  echo "10. 检查配置"
-  echo "11. 启动 sing-box"
-  echo "12. 重启 sing-box"
-  echo "13. 停止 sing-box"
-  echo "14. 查看日志"
-  echo "15. 更新管理"
-  echo "16. 系统优化"
-  echo "17. 安装/修复快捷命令 sb"
-  echo "18. 卸载"
+  echo "4. 添加 AnyTLS 入站"
+  echo "5. 添加 Door 转发入站"
+  echo "6. 删除入站"
+  echo "7. 查看节点信息"
+  echo "8. 查看 Hysteria2 链接/证书 pin"
+  echo "9. 查看 AnyTLS 链接/配置"
+  echo "10. 查看所有入站"
+  echo "11. 查看完整配置"
+  echo "12. 检查配置"
+  echo "13. 启动 sing-box"
+  echo "14. 重启 sing-box"
+  echo "15. 停止 sing-box"
+  echo "16. 查看日志"
+  echo "17. 更新管理"
+  echo "18. 系统优化"
+  echo "19. 安装/修复快捷命令 sb"
+  echo "20. 卸载"
   echo "0. 退出"
   echo "======================================"
   read -rp "请选择: " num
@@ -898,21 +1106,23 @@ menu(){
     1) install_base; start_service ;;
     2) add_reality ;;
     3) add_hysteria2 ;;
-    4) add_door ;;
-    5) delete_inbound ;;
-    6) show_info ;;
-    7) show_hysteria2_links ;;
-    8) show_inbounds ;;
-    9) show_config ;;
-    10) check_config ;;
-    11) start_service ;;
-    12) restart_service ;;
-    13) stop_service ;;
-    14) logs ;;
-    15) update_menu ;;
-    16) system_menu ;;
-    17) install_shortcut ;;
-    18) uninstall ;;
+    4) add_anytls ;;
+    5) add_door ;;
+    6) delete_inbound ;;
+    7) show_info ;;
+    8) show_hysteria2_links ;;
+    9) show_anytls_links ;;
+    10) show_inbounds ;;
+    11) show_config ;;
+    12) check_config ;;
+    13) start_service ;;
+    14) restart_service ;;
+    15) stop_service ;;
+    16) logs ;;
+    17) update_menu ;;
+    18) system_menu ;;
+    19) install_shortcut ;;
+    20) uninstall ;;
     0) exit 0 ;;
     *) red "无效选择" ;;
   esac

@@ -5,9 +5,10 @@ Docker 版 sing-box 多入站管理脚本。核心运行使用 SagerNet 官方 s
 ## 功能
 
 - 初始化 Docker / Docker Compose 运行环境
-- 使用固定版本镜像，默认 `ghcr.io/sagernet/sing-box:v1.13.12`
+- 使用固定版本镜像，默认 `ghcr.io/sagernet/sing-box:v1.13.14`
 - 添加 VLESS Reality 入站
 - 添加 Hysteria2 入站，支持自签证书或 Let's Encrypt 真实证书
+- 添加 AnyTLS 入站，支持自签证书或 Let's Encrypt 真实证书
 - 添加 Door 端口转发入站
 - 删除入站、查看配置、检查配置、备份恢复
 - 查看 Hysteria2 自签证书 `pinSHA256` hex 链接
@@ -47,13 +48,13 @@ sudo SCRIPT_URL=https://raw.githubusercontent.com/MISThelio/singbox-docker/main/
 ## 指定版本
 
 ```bash
-sudo SING_BOX_VERSION=v1.13.12 ./singbox-docker.sh
+sudo SING_BOX_VERSION=v1.13.14 ./singbox-docker.sh
 ```
 
 或指定完整镜像：
 
 ```bash
-sudo SING_BOX_IMAGE=ghcr.io/sagernet/sing-box:v1.13.12 ./singbox-docker.sh
+sudo SING_BOX_IMAGE=ghcr.io/sagernet/sing-box:v1.13.14 ./singbox-docker.sh
 ```
 
 ## 从源码构建镜像
@@ -61,8 +62,8 @@ sudo SING_BOX_IMAGE=ghcr.io/sagernet/sing-box:v1.13.12 ./singbox-docker.sh
 如需基于 SagerNet/sing-box 源码构建本地镜像：
 
 ```bash
-docker build --build-arg SING_BOX_VERSION=v1.13.12 -t local/sing-box:v1.13.12 .
-sudo SING_BOX_IMAGE=local/sing-box:v1.13.12 ./singbox-docker.sh
+docker build --build-arg SING_BOX_VERSION=v1.13.14 -t local/sing-box:v1.13.14 .
+sudo SING_BOX_IMAGE=local/sing-box:v1.13.14 ./singbox-docker.sh
 ```
 
 ## Hysteria2 证书
@@ -74,10 +75,17 @@ sudo SING_BOX_IMAGE=local/sing-box:v1.13.12 ./singbox-docker.sh
 
 真实证书模式会把证书复制到 `/opt/sing-box/config/cert-标签/`，并安装 certbot 续期 hook，续期后自动重启 sing-box 容器。
 
+## AnyTLS
+
+AnyTLS 从 sing-box `1.12.0` 开始支持。本脚本会生成 AnyTLS 入站配置，并在菜单中显示 AnyTLS URI 和 sing-box 客户端出站 JSON。
+
+不同客户端对 AnyTLS URI 的支持程度不一致；如果导入失败，请使用菜单里的 sing-box 客户端出站配置手动添加。
+
 ## 注意
 
 - VLESS Reality 通常只需要放行 TCP 端口。
 - Hysteria2 需要放行 UDP 端口，脚本也会提示 TCP/UDP 安全组。
+- AnyTLS 需要放行 TCP 端口。
 - Hysteria2 如果选择 Let's Encrypt 真实证书，请额外在系统防火墙和云安全组放行 `80/tcp`，并确保 80 端口没有被其他服务占用。
 - Hysteria2 默认使用自签证书；部分 Xray-core 新版客户端已移除 `allowInsecure`，请优先使用菜单里的 `查看 Hysteria2 链接/证书 pin` 获取十六进制 `pinSHA256` 链接，或在客户端手动填写 `pinnedPeerCertSha256`。
 - BBR 是宿主机 Linux 内核参数，不是 sing-box 或 Docker 容器配置；它主要影响 TCP，对 Hysteria2 的 UDP 流量基本无效。
