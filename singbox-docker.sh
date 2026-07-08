@@ -253,6 +253,50 @@ add_inbound(){
   mv "$tmp" "$CONFIG_FILE"
 }
 
+latest_info_block_by_tag(){
+  local tag="$1"
+  [ -f "$INFO_FILE" ] || return 1
+
+  awk -v want="$tag" '
+    BEGIN { RS="=============================="; block="" }
+    {
+      found=0
+      n=split($0, lines, "\n")
+      for (i=1; i<=n; i++) {
+        if (lines[i] == "标签：" want) found=1
+      }
+      if (found) block=$0
+    }
+    END {
+      if (block != "") {
+        print "==============================" block "=============================="
+      }
+    }
+  ' "$INFO_FILE"
+}
+
+remove_info_by_tag(){
+  local tag="$1"
+  local tmp
+  [ -f "$INFO_FILE" ] || return 0
+
+  tmp=$(mktemp)
+  awk -v remove="$tag" '
+    BEGIN { RS="=============================="; ORS="" }
+    {
+      found=0
+      n=split($0, lines, "\n")
+      for (i=1; i<=n; i++) {
+        if (lines[i] == "标签：" remove) found=1
+      }
+      if (!found && $0 ~ /[^[:space:]]/) {
+        print "==============================" $0 "=============================="
+      }
+    }
+  ' "$INFO_FILE" > "$tmp"
+  mv "$tmp" "$INFO_FILE"
+}
+
 check_config(){
   mkdir -p "$CONFIG_DIR"
   docker run --rm \
@@ -705,6 +749,7 @@ delete_inbound(){
   tmp=$(mktemp)
   jq --arg tag "$tag" '.inbounds = [.inbounds[] | select(.tag != $tag)]' "$CONFIG_FILE" > "$tmp"
   mv "$tmp" "$CONFIG_FILE"
+  remove_info_by_tag "$tag"
   check_config
   restart_service
   green "入站 $tag 已删除"
@@ -716,39 +761,77 @@ show_info(){
     return
   fi
 
-  if [ ! -f "$INFO_FILE" ]; then
-    yellow "暂无节点信息"
-    return
-  fi
-
-  local tags
-  tags=$(jq -r '.inbounds[]?.tag' "$CONFIG_FILE" | awk 'BEGIN{printf "|"} {printf "%s|",$0}')
-  if [ "$tags" = "|" ]; then
+  local count server_ip
+  count=$(jq '.inbounds | length' "$CONFIG_FILE")
+  if [ "$count" -eq 0 ]; then
     yellow "当前没有入站节点"
     return
   fi
 
-  awk -v tags="$tags" '
-    BEGIN { RS="=============================="; shown=0 }
-    {
-      keep=0
-      n=split($0, lines, "\n")
-      for (i=1; i<=n; i++) {
-        if (lines[i] ~ /^标签：/) {
-          tag=lines[i]
-          sub(/^标签：/, "", tag)
-          if (index(tags, "|" tag "|") > 0) keep=1
-        }
-      }
-      if (keep) {
-        print "==============================" $0 "=============================="
-        shown=1
-      }
-    }
-    END {
-      if (!shown) print "暂无可展示的节点链接信息；可在协议专用菜单中查看当前入站配置。"
-    }
-  ' "$INFO_FILE"
+  server_ip=$(public_ip)
+  jq -c '.inbounds[]?' "$CONFIG_FILE" | while IFS= read -r inbound; do
+    local type tag port block
+    type=$(printf '%s' "$inbound" | jq -r '.type')
+    tag=$(printf '%s' "$inbound" | jq -r '.tag')
+    port=$(printf '%s' "$inbound" | jq -r '.listen_port')
+
+    case "$type" in
+      vless)
+        block=$(latest_info_block_by_tag "$tag" || true)
+        if [ -n "$block" ]; then
+          printf '%s\n' "$block"
+        else
+          echo
+          echo "=============================="
+          echo "类型：VLESS Reality"
+          echo "标签：$tag"
+          echo "地址：$server_ip"
+          echo "端口：$port"
+          echo "UUID：$(printf '%s' "$inbound" | jq -r '.users[0].uuid // empty')"
+          echo "Flow：$(printf '%s' "$inbound" | jq -r '.users[0].flow // empty')"
+          echo "SNI：$(printf '%s' "$inbound" | jq -r '.tls.server_name // empty')"
+          echo "提示：缺少历史节点记录，无法从 config.json 反推出 Reality PublicKey。"
+          echo "=============================="
+        fi
+        ;;
+      hysteria2|anytls)
+        block=$(latest_info_block_by_tag "$tag" || true)
+        if [ -n "$block" ]; then
+          printf '%s\n' "$block"
+        else
+          echo
+          echo "=============================="
+          echo "类型：$type"
+          echo "标签：$tag"
+          echo "地址：$server_ip"
+          echo "端口：$port"
+          echo "密码：$(printf '%s' "$inbound" | jq -r '.users[0].password // empty')"
+          echo "SNI：$(printf '%s' "$inbound" | jq -r '.tls.server_name // empty')"
+          echo "提示：缺少历史节点记录，可使用协议专用菜单重新生成链接。"
+          echo "=============================="
+        fi
+        ;;
+      direct)
+        echo
+        echo "=============================="
+        echo "类型：Door 转发"
+        echo "标签：$tag"
+        echo "监听端口：$port"
+        echo "网络：$(printf '%s' "$inbound" | jq -r '.network // empty')"
+        echo "转发目标：$(printf '%s' "$inbound" | jq -r '.override_address // empty'):$(printf '%s' "$inbound" | jq -r '.override_port // empty')"
+        echo "=============================="
+        ;;
+      *)
+        echo
+        echo "=============================="
+        echo "类型：$type"
+        echo "标签：$tag"
+        echo "端口：$port"
+        echo "提示：未知入站类型，仅显示基础信息。"
+        echo "=============================="
+        ;;
+    esac
+  done
 }
 
 show_config(){
