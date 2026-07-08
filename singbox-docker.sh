@@ -11,7 +11,9 @@ INFO_FILE="$WORK_DIR/nodes.txt"
 COMPOSE_FILE="$WORK_DIR/docker-compose.yml"
 BACKUP_DIR="$WORK_DIR/backup"
 SCRIPT_PATH="${SCRIPT_PATH:-/usr/local/bin/sb}"
-SCRIPT_URL="${SCRIPT_URL:-https://api.github.com/repos/MISThelio/singbox-docker/contents/singbox-docker.sh?ref=main}"
+DEFAULT_SCRIPT_URL="https://api.github.com/repos/MISThelio/singbox-docker/contents/singbox-docker.sh?ref=main"
+FALLBACK_SCRIPT_URL="https://raw.githubusercontent.com/MISThelio/singbox-docker/main/singbox-docker.sh"
+SCRIPT_URL="${SCRIPT_URL:-$DEFAULT_SCRIPT_URL}"
 SCRIPT_ACCEPT="${SCRIPT_ACCEPT:-application/vnd.github.raw}"
 
 green(){ printf '\033[32m%s\033[0m\n' "$1"; }
@@ -1136,28 +1138,65 @@ update_singbox_image(){
 }
 
 update_script(){
-  if [ -z "$SCRIPT_URL" ]; then
-    red "当前未配置 SCRIPT_URL，不能自动更新脚本自身"
-    echo
-    echo "可以把脚本上传到 GitHub Raw / Gitee Raw / 自己的网站，然后设置环境变量："
-    echo "SCRIPT_URL=\"https://你的地址/singbox-docker.sh\" sb"
+  local tmp backup urls url ok old_sum new_sum
+  tmp="$(mktemp)"
+  backup="$SCRIPT_PATH.bak.$(date +%Y%m%d-%H%M%S)"
+  ok=0
+
+  urls="$SCRIPT_URL"
+  if [ "$SCRIPT_URL" != "$FALLBACK_SCRIPT_URL" ]; then
+    urls="$urls $FALLBACK_SCRIPT_URL"
+  fi
+
+  yellow "下载新脚本..."
+  for url in $urls; do
+    echo "尝试：$url"
+    if [ "$url" = "$DEFAULT_SCRIPT_URL" ]; then
+      if curl -fsSL -H "Accept: $SCRIPT_ACCEPT" -H "Cache-Control: no-cache" "$url" -o "$tmp"; then
+        ok=1
+        break
+      fi
+    else
+      if curl -fsSL -H "Cache-Control: no-cache" "$url" -o "$tmp"; then
+        ok=1
+        break
+      fi
+    fi
+  done
+
+  if [ "$ok" -ne 1 ]; then
+    rm -f "$tmp"
+    red "下载新脚本失败，请检查服务器到 GitHub 的网络"
     return
   fi
 
-  yellow "备份当前脚本..."
-  cp "$SCRIPT_PATH" "$SCRIPT_PATH.bak.$(date +%Y%m%d-%H%M%S)"
-
-  yellow "下载新脚本..."
-  curl -fsSL -H "Accept: $SCRIPT_ACCEPT" -H "Cache-Control: no-cache" "$SCRIPT_URL" -o "$SCRIPT_PATH.tmp"
-
-  if bash -n "$SCRIPT_PATH.tmp"; then
-    mv "$SCRIPT_PATH.tmp" "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH"
-    green "脚本自身已更新"
-  else
-    rm -f "$SCRIPT_PATH.tmp"
-    red "新脚本语法检查失败，已取消更新"
+  if ! grep -q 'sing-box Docker' "$tmp" || ! grep -q 'add_config_menu' "$tmp"; then
+    rm -f "$tmp"
+    red "下载内容不像 singbox-docker 脚本，已取消更新"
+    return
   fi
+
+  if ! bash -n "$tmp"; then
+    rm -f "$tmp"
+    red "新脚本语法检查失败，已取消更新"
+    return
+  fi
+
+  old_sum="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}' || true)"
+  new_sum="$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}' || true)"
+  if [ -n "$old_sum" ] && [ "$old_sum" = "$new_sum" ]; then
+    rm -f "$tmp"
+    yellow "脚本已是最新，无需更新"
+    return
+  fi
+
+  yellow "备份当前脚本：$backup"
+  cp "$SCRIPT_PATH" "$backup"
+  install -m 0755 "$tmp" "$SCRIPT_PATH"
+  rm -f "$tmp"
+
+  green "脚本自身已更新"
+  yellow "当前正在运行的菜单不会自动变成新版本，请退出后重新执行：sb"
 }
 
 update_menu(){
