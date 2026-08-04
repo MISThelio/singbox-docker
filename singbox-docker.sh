@@ -147,6 +147,65 @@ install_base(){
   green "基础环境初始化完成"
 }
 
+prepare_runtime(){
+  local missing=0
+
+  for cmd in docker jq openssl curl ss uuidgen; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      red "缺少命令：$cmd"
+      missing=1
+    fi
+  done
+
+  if ! docker compose version >/dev/null 2>&1; then
+    red "Docker Compose 插件不可用"
+    missing=1
+  fi
+
+  if [ "$missing" -ne 0 ]; then
+    yellow "请先进入：系统优化 -> 初始化/修复 sing-box Docker 环境"
+    return 1
+  fi
+
+  mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$BACKUP_DIR"
+  write_default_config
+  write_compose_file
+  install_shortcut
+}
+
+ensure_singbox_image(){
+  if docker image inspect "$SING_BOX_IMAGE" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  yellow "本地没有 sing-box 镜像，正在拉取：$SING_BOX_IMAGE"
+  local pull_log
+  pull_log=$(mktemp)
+
+  if docker pull "$SING_BOX_IMAGE" 2>&1 | tee "$pull_log"; then
+    rm -f "$pull_log"
+    return 0
+  fi
+
+  if grep -qi 'denied' "$pull_log" && printf '%s' "$SING_BOX_IMAGE" | grep -q '^ghcr\.io/'; then
+    red "GHCR 返回 denied。常见原因是 Docker 保存了失效的 ghcr.io 登录凭据，或当前网络无法匿名拉取 GHCR。"
+    read -rp "是否执行 docker logout ghcr.io 后重试？输入 y: " retry_ghcr
+    if [ "$retry_ghcr" = "y" ]; then
+      docker logout ghcr.io || true
+      if docker pull "$SING_BOX_IMAGE"; then
+        rm -f "$pull_log"
+        return 0
+      fi
+    fi
+  fi
+
+  rm -f "$pull_log"
+  red "sing-box 镜像不可用，已停止操作；配置文件不会继续写入。"
+  yellow "可尝试手动执行：docker logout ghcr.io && docker pull $SING_BOX_IMAGE"
+  yellow "如果仍失败，可临时指定可用镜像运行脚本：SING_BOX_IMAGE=你的镜像 sb"
+  return 1
+}
+
 public_ip(){
   curl -4fsS https://api.ipify.org || curl -4fsS https://ifconfig.me || printf 'SERVER_IP'
 }
@@ -299,6 +358,7 @@ remove_info_by_tag(){
 
 check_config(){
   mkdir -p "$CONFIG_DIR"
+  ensure_singbox_image || return
   docker run --rm \
     -v "$CONFIG_DIR:/etc/sing-box" \
     "$SING_BOX_IMAGE" \
@@ -348,7 +408,8 @@ read_port(){
 }
 
 add_reality(){
-  install_base
+  prepare_runtime || return
+  ensure_singbox_image || return
 
   local port tag sni uuid short_id server_ip key_output private_key public_key inbound
   port=$(read_port "监听端口 [默认 443]: " 443) || return
@@ -433,7 +494,7 @@ EOFINFO
 }
 
 add_hysteria2(){
-  install_base
+  prepare_runtime || return
 
   local port tag password sni cert_dir server_ip inbound cert_pin_hex password_uri tag_uri cert_mode cert_note link_host email
   port=$(read_port "监听端口 [默认 8443]: " 8443) || return
@@ -449,6 +510,8 @@ add_hysteria2(){
     red "标签 $tag 已存在，请换一个标签"
     return
   fi
+
+  ensure_singbox_image || return
 
   read -rp "密码 [留空自动生成]: " password
   password=${password:-$(openssl rand -hex 16)}
@@ -547,7 +610,7 @@ EOFINFO
 }
 
 add_anytls(){
-  install_base
+  prepare_runtime || return
 
   local port tag password sni cert_dir server_ip inbound cert_pin_hex password_uri tag_uri cert_mode cert_note link_host email
   port=$(read_port "监听端口 [默认 8444]: " 8444) || return
@@ -563,6 +626,8 @@ add_anytls(){
     red "标签 $tag 已存在，请换一个标签"
     return
   fi
+
+  ensure_singbox_image || return
 
   read -rp "密码 [留空自动生成]: " password
   password=${password:-$(openssl rand -base64 18)}
@@ -669,7 +734,7 @@ EOFINFO
 }
 
 add_door(){
-  install_base
+  prepare_runtime || return
 
   local port tag target target_port network inbound
   port=$(read_port "本地监听端口，例如 2080: " "") || return
@@ -685,6 +750,8 @@ add_door(){
     red "标签 $tag 已存在，请换一个标签"
     return
   fi
+
+  ensure_singbox_image || return
 
   read -rp "转发目标地址，例如 1.1.1.1 或 example.com: " target
   [ -n "$target" ] || { red "目标地址不能为空"; return; }
@@ -732,7 +799,8 @@ EOFINFO
 }
 
 delete_inbound(){
-  install_base
+  prepare_runtime || return
+  ensure_singbox_image || return
 
   show_inbounds
   echo
