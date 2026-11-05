@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
-SCRIPT_VERSION="2026.11.06.2"
+SCRIPT_VERSION="2026.11.06.3"
 
 SING_BOX_VERSION="${SING_BOX_VERSION:-latest}"
 SING_BOX_IMAGE="${SING_BOX_IMAGE:-ghcr.io/sagernet/sing-box:${SING_BOX_VERSION}}"
@@ -18,6 +18,7 @@ FALLBACK_SCRIPT_URL="https://raw.githubusercontent.com/MISThelio/singbox-docker/
 SCRIPT_URL="${SCRIPT_URL:-$DEFAULT_SCRIPT_URL}"
 SCRIPT_ACCEPT="${SCRIPT_ACCEPT:-application/vnd.github.raw}"
 NGINX_IMAGE="${NGINX_IMAGE:-nginx:stable-alpine}"
+LETSENCRYPT_DIR="${LETSENCRYPT_DIR:-/etc/letsencrypt}"
 
 green(){ printf '\033[32m%s\033[0m\n' "$1"; }
 yellow(){ printf '\033[33m%s\033[0m\n' "$1"; }
@@ -48,17 +49,17 @@ install_shortcut(){
 install_packages(){
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update
-    apt-get install -y curl wget openssl jq uuid-runtime util-linux ca-certificates iproute2
+    apt-get install -y curl wget openssl jq uuid-runtime util-linux ca-certificates iproute2 python3
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y curl wget openssl jq util-linux ca-certificates iproute
+    dnf install -y curl wget openssl jq util-linux ca-certificates iproute python3
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y curl wget openssl jq util-linux ca-certificates iproute
+    yum install -y curl wget openssl jq util-linux ca-certificates iproute python3
   elif command -v zypper >/dev/null 2>&1; then
     zypper --non-interactive refresh
-    zypper --non-interactive install curl wget openssl jq util-linux ca-certificates iproute2
+    zypper --non-interactive install curl wget openssl jq util-linux ca-certificates iproute2 python3
   elif command -v apk >/dev/null 2>&1; then
     apk update
-    apk add --no-cache bash curl wget openssl jq util-linux ca-certificates iproute2 gcompat
+    apk add --no-cache bash curl wget openssl jq util-linux ca-certificates iproute2 gcompat python3
   else
     red "暂不支持当前系统包管理器，请手动安装 bash/curl/wget/openssl/jq/uuidgen/iproute2"
     exit 1
@@ -381,21 +382,263 @@ gateway_running(){
   [ -n "$id" ] && [ "$(docker inspect --format '{{.State.Running}}' "$id")" = true ]
 }
 
+# Keep Certbot INI parsing and compare-and-restore in one embedded helper so self-update stays single-file.
+certificate_state(){
+  command -v python3 >/dev/null 2>&1 || { red "证书迁移需要 python3，请先在系统优化中初始化依赖" >&2; return 1; }
+  python3 - "$LETSENCRYPT_DIR" "$@" <<'PYCERT'
+import configparser, contextlib, fcntl, hashlib, json, os, pathlib, re, shutil, sys, tempfile
+root = pathlib.Path(sys.argv[1])
+action, *args = sys.argv[2:]
+def regular(path):
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("Not a regular renewal file: " + str(path))
+def digest(path):
+    regular(path)
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+def read(path):
+    regular(path)
+    parser = configparser.ConfigParser(interpolation=None, strict=True)
+    text = re.sub(r'^\s*\[\[([^\]]+)\]\]\s*$', r'[\1]', path.read_text(), flags=re.M)
+    parser.read_string('[lineage]\n' + text)
+    return {s: {k.replace('-', '_'): v.strip().strip('\"\x27') for k, v in parser[s].items()} for s in parser.sections()}
+def info(path):
+    data = read(path)
+    name = path.stem
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,252}', name):
+        raise ValueError('Unsafe certificate name')
+    return dict(name=name, sha=digest(path), lineage=data.get('lineage', {}), params=data.get('renewalparams', {}),
+                webroot_map=data.get('webroot_map', {}))
+def immutable(data):
+    result = {s: dict(v) for s, v in data.items() if s != 'webroot_map'}
+    result.get('lineage', {}).pop('version', None)
+    for k in ('authenticator', 'webroot_path', 'pref_challs', 'preferred_challenges'):
+        result.get('renewalparams', {}).pop(k, None)
+    return result
+def atomic_json(path, value):
+    fd, tmp = tempfile.mkstemp(dir=path.parent)
+    with os.fdopen(fd, 'w') as stream:
+        json.dump(value, stream)
+        stream.flush(); os.fsync(stream.fileno())
+    os.replace(tmp, path)
+@contextlib.contextmanager
+def lock():
+    # Same POSIX lock and inode check as Certbot; never unlink another process's lock.
+    path = root / '.certbot.lock'
+    while True:
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            a, b = os.fstat(fd), path.stat()
+            if (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino):
+                break
+        except BaseException:
+            os.close(fd)
+            raise
+        os.close(fd)
+    try:
+        yield
+    finally:
+        path.unlink()
+        os.close(fd)
+try:
+    if action == 'inventory':
+        print(json.dumps([info(p) for p in sorted((root / 'renewal').glob('*.conf'))]))
+    elif action == 'hooks':
+        paths = [root / 'cli.ini'] if (root / 'cli.ini').exists() else []
+        paths += [root / 'renewal' / (args[0] + '.conf')]
+        for path in paths:
+            data = read(path)
+            for section in data.values():
+                for key in ('pre_hook', 'post_hook', 'renew_hook', 'deploy_hook', 'installer'):
+                    if section.get(key, '').lower() not in ('', 'none'):
+                        raise ValueError('Unmanaged hook/installer: ' + str(path) + ': ' + key)
+        for kind in ('pre', 'post'):
+            for path in (root / 'renewal-hooks' / kind).glob('*'):
+                if path.is_file() and os.access(path, os.X_OK):
+                    raise ValueError('Executable global validation hook: ' + str(path))
+    elif action in ('snapshot', 'checkpoint'):
+        name, directory = args[:2]
+        directory = pathlib.Path(directory)
+        journal = directory / (name + '.json')
+        original = directory / (name + '.conf')
+        current = root / 'renewal' / (name + '.conf')
+        with lock():
+            if action == 'snapshot':
+                if not journal.exists():
+                    if digest(current) != args[2]:
+                        raise ValueError('Renewal changed since approval: ' + name)
+                    shutil.copy2(current, original)
+                    atomic_json(journal, dict(before=digest(original), expected=digest(original)))
+            else:
+                if immutable(read(original)) != immutable(read(current)):
+                    raise ValueError('Unexpected renewal changes: ' + name)
+                value = json.loads(journal.read_text())
+                value['expected'] = digest(current)
+                atomic_json(journal, value)
+    elif action == 'rollback':
+        directory = pathlib.Path(args[0])
+        with lock():
+            records = []
+            for journal in directory.glob('*.json'):
+                value = json.loads(journal.read_text())
+                current = root / 'renewal' / (journal.stem + '.conf')
+                if digest(current) not in (value['before'], value['expected']):
+                    raise ValueError('Concurrent renewal change; refusing overwrite: ' + str(current))
+                original = journal.with_suffix('.conf')
+                if digest(original) != value['before']:
+                    raise ValueError('Certificate backup checksum mismatch')
+                records.append((original, current))
+            for original, current in records:
+                fd, tmp = tempfile.mkstemp(dir=current.parent)
+                os.close(fd)
+                try:
+                    shutil.copy2(original, tmp)
+                    stat = original.stat()
+                    os.chown(tmp, stat.st_uid, stat.st_gid)
+                    os.replace(tmp, current)
+                finally:
+                    if os.path.exists(tmp): os.unlink(tmp)
+    else:
+        raise ValueError('Unknown certificate operation')
+except Exception as error:
+    print('Certificate safety check: ' + str(error), file=sys.stderr)
+    sys.exit(1)
+PYCERT
+}
+
+certificate_inventory(){
+  if ! compgen -G "$LETSENCRYPT_DIR/renewal/*.conf" >/dev/null; then echo '[]'; return 0; fi
+  certificate_state inventory
+}
+
+legacy_cert_hook_contents(){
+  local domain="$1" cert_dir="$2"
+  cat <<EOFHOOK
+#!/usr/bin/env bash
+set -e
+if [ "\$RENEWED_LINEAGE" = "$LETSENCRYPT_DIR/live/$domain" ]; then
+  cp "\$RENEWED_LINEAGE/fullchain.pem" "$cert_dir/cert.pem"
+  cp "\$RENEWED_LINEAGE/privkey.pem" "$cert_dir/private.key"
+  chmod 600 "$cert_dir/private.key"
+  cd "$WORK_DIR"
+  docker compose --project-directory "$WORK_DIR" -f "$COMPOSE_FILE" restart sing-box
+fi
+EOFHOOK
+}
+
+certificate_owned(){
+  local name="$1" inventory="$2" tag cert_dir hook expected actual
+  valid_domain "$name" || return 1
+  jq -e --arg name "$name" --arg live "$LETSENCRYPT_DIR/live/$name" '
+    .[] | select(.name == $name) | .lineage.fullchain == ($live+"/fullchain.pem") and .lineage.privkey == ($live+"/privkey.pem")' <<< "$inventory" >/dev/null || return 1
+  expected=$(cert_pin_sha256_hex "$LETSENCRYPT_DIR/live/$name/fullchain.pem") || return 1
+  [ -n "$expected" ] || return 1
+  while IFS= read -r tag; do
+    valid_node_tag "$tag" || continue
+    cert_dir="$CONFIG_DIR/cert-$tag"
+    hook="$LETSENCRYPT_DIR/renewal-hooks/deploy/singbox-docker-$tag.sh"
+    [ -f "$hook" ] && [ ! -L "$hook" ] || continue
+    cmp -s "$hook" <(legacy_cert_hook_contents "$name" "$cert_dir") || continue
+    actual=$(cert_pin_sha256_hex "$cert_dir/cert.pem") || continue
+    [ "$actual" = "$expected" ] || continue
+    validate_certificate "$name" "$cert_dir/cert.pem" "$cert_dir/private.key" >/dev/null 2>&1 || continue
+    return 0
+  done < <(jq -r '.inbounds[] | select(.type == "hysteria2" or .type == "anytls") |
+    select(.tls.certificate_path == ("/etc/sing-box/cert-"+.tag+"/cert.pem") and
+           .tls.key_path == ("/etc/sing-box/cert-"+.tag+"/private.key")) | .tag' "$CONFIG_FILE")
+  return 1
+}
+
+certificate_migration_plan(){
+  local inventory name choice version major minor
+  inventory=$(certificate_inventory) || return 1
+  migration_plan=$(jq '[.[] | select(.params.authenticator == "standalone")]' <<< "$inventory") || return 1
+  [ "$(jq length <<< "$migration_plan")" -gt 0 ] || return 0
+  [ -n "${snapshot:-}" ] || { red "请从添加配置流程启用共享入口，以确认旧证书迁移"; return 1; }
+  while IFS= read -r name; do
+    certificate_owned "$name" "$inventory" || { red "证书归属无法确认，不会自动迁移：$name"; return 1; }
+    certificate_state hooks "$name" || return 1
+  done < <(jq -r '.[].name' <<< "$migration_plan")
+  install_certbot || return 1
+  version=$(certbot --version 2>&1) || return 1
+  [[ "$version" =~ ([0-9]+)\.([0-9]+)\.([0-9]+) ]] || return 1
+  major="${BASH_REMATCH[1]}"; minor="${BASH_REMATCH[2]}"
+  if ((major < 2 || (major == 2 && minor < 3))); then red "迁移需要 Certbot 2.3 或更新版本，请先升级 Certbot"; return 1; fi
+  yellow "以下旧证书由本脚本管理，启用共享入口需将续期从 standalone 迁移为 webroot："
+  jq -r '.[].name' <<< "$migration_plan"
+  yellow "将备份续期设置，使用测试续期验证；保留现有证书、私钥和部署钩子。80/TCP 需持续开放。"
+  read -rp "确认迁移并启用共享入口？输入 y [默认取消]: " choice || return 1
+  [ "$choice" = y ] || { yellow "已取消，旧证书未修改"; return 1; }
+  migration_approved=1
+}
+
+certificate_uses_gateway(){
+  jq -e --arg name "$1" --arg path "$CONFIG_DIR/gateway/acme" '.[] | select(.name == $name) |
+    .params.authenticator == "webroot" and
+    (if (.webroot_map | length) > 0 then all(.webroot_map[]; . == $path)
+     else (.params.webroot_path // "" | split(",") | map(gsub("^[[:space:]\"\u0027]+|[[:space:]\"\u0027]+$"; "")) |
+           map(select(length > 0))) == [$path] end)' <<< "$2" >/dev/null
+}
+
+certificate_reconfigure(){
+  local name="$1" sha="$2" status=0 inventory
+  [ -n "${snapshot:-}" ] || return 1
+  certificate_state hooks "$name" || return 1
+  if [ -z "${certificate_journal:-}" ]; then
+    mkdir -p "$BACKUP_DIR" || return 1
+    certificate_journal=$(mktemp -d "$BACKUP_DIR/certbot-migration-$(date +%Y%m%d-%H%M%S)-XXXXXX") || return 1
+    chmod 700 "$certificate_journal"
+    cp -a "$snapshot/config" "$certificate_journal/config" || return 1
+    cp -p "$snapshot/compose" "$certificate_journal/compose" || return 1
+    [ ! -f "$snapshot/info" ] || cp -p "$snapshot/info" "$certificate_journal/info" || return 1
+    [ ! -d "$LETSENCRYPT_DIR/renewal-hooks" ] || cp -a "$LETSENCRYPT_DIR/renewal-hooks" "$certificate_journal/hooks" || return 1
+    green "证书迁移备份：$certificate_journal"
+  fi
+  certificate_state snapshot "$name" "$certificate_journal" "$sha" || return 1
+  certbot reconfigure --config-dir "$LETSENCRYPT_DIR" --cert-name "$name" --webroot \
+    -w "$CONFIG_DIR/gateway/acme" --non-interactive --no-directory-hooks || status=$?
+  certificate_state checkpoint "$name" "$certificate_journal" || return 1
+  [ "$status" -eq 0 ] || return "$status"
+  inventory=$(certificate_inventory) || return 1
+  certificate_uses_gateway "$name" "$inventory" || return 1
+  green "旧证书已通过测试续期并迁移：$name"
+}
+
+certificate_migrate(){
+  local name sha
+  [ "${migration_approved:-0}" -eq 1 ] || return 0
+  open_port 80 tcp
+  while IFS=$'\t' read -r name sha; do
+    certificate_reconfigure "$name" "$sha" || return 1
+  done < <(jq -r '.[] | [.name,.sha] | @tsv' <<< "$migration_plan")
+  migration_approved=0
+}
+
+certificate_gateway_required(){
+  local inventory
+  inventory=$(certificate_inventory) || return 2
+  jq -e --arg path "$CONFIG_DIR/gateway/acme" 'any(.[];
+    .params.authenticator == "webroot" and
+    ((.params.webroot_path // "" | contains($path)) or any(.webroot_map[]; . == $path)))' <<< "$inventory" >/dev/null
+}
+
+certificate_guard_gateway_removal(){
+  local status=0
+  certificate_gateway_required || status=$?
+  if [ "$status" -eq 1 ]; then return 0; fi
+  red "仍有证书使用共享入口的 webroot 自动续期，不能关闭或删除验证目录。"
+  yellow "请先将这些证书迁移到持续可用的其他 webroot 或 DNS 验证；本次操作未执行。"
+  return 1
+}
+
 gateway_preflight(){
-  local port existing renewal
+  local port existing inventory name sha
   existing=$(compose config --format json | jq -r '.services["singbox-gateway"].labels["io.singbox-docker.gateway"] // empty') || return 1
   [ -z "$existing" ] || [ "$existing" = true ] || return 1
   if compose config --format json | jq -e '.services | has("singbox-gateway")' >/dev/null; then
     [ "$existing" = true ] || { red "singbox-gateway 服务名称已被其他配置占用"; return 1; }
   fi
   if ! gateway_running; then
-    for renewal in /etc/letsencrypt/renewal/*.conf; do
-      if [ -f "$renewal" ] && grep -Eq '^[[:space:]]*authenticator[[:space:]]*=[[:space:]]*standalone[[:space:]]*$' "$renewal"; then
-        red "发现依赖独占 80/TCP 的已有证书续期：$renewal"
-        yellow "请先将该证书改为 DNS 或持续可用的网站目录验证，再启用共享入口，避免破坏旧证书续期。"
-        return 1
-      fi
-    done
     for port in 80 443; do
       if port_used "$port" tcp; then
         red "$port/TCP 已被占用，不能自动启用共享入口；不会停止或修改现有网站。"
@@ -404,6 +647,14 @@ gateway_preflight(){
       fi
     done
   fi
+  [ "${1:-}" != ports-only ] || return 0
+  inventory=$(certificate_inventory) || return 1
+  while IFS=$'\t' read -r name sha; do
+    if [ "${migration_approved:-0}" != 1 ] || ! jq -e --arg name "$name" --arg sha "$sha" \
+      'any(.[]; .name == $name and .sha == $sha)' <<< "${migration_plan:-[]}" >/dev/null; then
+      red "发现尚未迁移的 standalone 证书：$name；请从添加配置流程确认迁移。"; return 1
+    fi
+  done < <(jq -r '.[] | select(.params.authenticator == "standalone") | [.name,.sha] | @tsv' <<< "$inventory")
 }
 
 allocate_private_port(){
@@ -422,10 +673,13 @@ allocate_private_port(){
 
 gateway_initialize(){
   local state="$CONFIG_DIR/.shared-443" tls_port flags
+  gateway_preflight ports-only || return 1
+  certificate_migration_plan || return 1
   gateway_preflight || return 1
   if [ -f "$state" ]; then
     if ! gateway_running; then gateway_apply || return 1; fi
-    return 0
+    certificate_migrate
+    return $?
   fi
   docker image inspect "$NGINX_IMAGE" >/dev/null 2>&1 || docker pull "$NGINX_IMAGE" || return 1
   flags=$(docker run --rm --entrypoint nginx "$NGINX_IMAGE" -V 2>&1) || return 1
@@ -437,13 +691,14 @@ gateway_initialize(){
     --argjson dynamic "$(if [[ "$flags" == *--with-stream=dynamic* ]]; then echo true; else echo false; fi)" \
     '{version:1,nginx_image:$image,tls_port:$tls_port,dynamic_stream:$dynamic,domains:{}}' > "$state"
   # Bootstrap HTTP-01 before issuing certificates; renewals then keep using webroot, never standalone.
-  gateway_apply
+  gateway_apply || return 1
+  certificate_migrate
 }
 
 gateway_certificate(){
   local domain="$1" cert_dir="$CONFIG_DIR/gateway/certs/$1" choice email=""
-  GW_SOURCE_CERT="/etc/letsencrypt/live/$domain/fullchain.pem"
-  GW_SOURCE_KEY="/etc/letsencrypt/live/$domain/privkey.pem"
+  GW_SOURCE_CERT="$LETSENCRYPT_DIR/live/$domain/fullchain.pem"
+  GW_SOURCE_KEY="$LETSENCRYPT_DIR/live/$domain/privkey.pem"
   echo "证书来源：1. 自动申请 / 复用 Let's Encrypt（默认）  2. 导入已有证书"
   read -rp "请选择 [默认 1]: " choice
   case "${choice:-1}" in
@@ -451,9 +706,19 @@ gateway_certificate(){
         install_certbot || return 1
         open_port 80 tcp
         if validate_certificate "$domain" "$GW_SOURCE_CERT" "$GW_SOURCE_KEY" >/dev/null 2>&1; then
-          certbot reconfigure --cert-name "$domain" --webroot -w "$CONFIG_DIR/gateway/acme" --non-interactive || return 1
+          local inventory sha
+          inventory=$(certificate_inventory) || return 1
+          sha=$(jq -er --arg name "$domain" '.[] | select(.name == $name) | .sha' <<< "$inventory") || return 1
+          if ! certificate_uses_gateway "$domain" "$inventory"; then
+            certificate_owned "$domain" "$inventory" || { red "不会自动修改非本脚本管理的旧证书，请选择导入证书"; return 1; }
+            certificate_reconfigure "$domain" "$sha" || return 1
+          fi
         else
-        local args=(certonly --non-interactive --agree-tos --preferred-challenges http --cert-name "$domain" -d "$domain")
+        if [ -e "$LETSENCRYPT_DIR/renewal/$domain.conf" ]; then
+          red "已有同名证书但当前文件未通过验证，请先修复旧证书或选择导入；不会自动覆盖或强制重签。"
+          return 1
+        fi
+        local args=(certonly --config-dir "$LETSENCRYPT_DIR" --non-interactive --agree-tos --preferred-challenges http --cert-name "$domain" -d "$domain")
         read -rp "Let's Encrypt 邮箱 [可留空]: " email
         if [ -n "$email" ]; then args+=(-m "$email"); else args+=(--register-unsafely-without-email); fi
         args+=(--webroot -w "$CONFIG_DIR/gateway/acme")
@@ -570,6 +835,7 @@ restore_gateway_service(){
 
 shared_transaction() (
   local snapshot completed=0 old_id old_image="" gateway_id gateway_was_running=0 core_was_running=0
+  local certificate_journal="" migration_plan='[]' migration_approved=0
   snapshot=$(mktemp -d "$WORK_DIR/.shared-operation.XXXXXX") || return 1
   cp -a "$CONFIG_DIR" "$snapshot/config" || return 1
   cp -p "$COMPOSE_FILE" "$snapshot/compose" || return 1
@@ -593,6 +859,21 @@ shared_cleanup(){
   local result=$? id recovered=1 core_changed=0 gateway_changed=0
   trap - EXIT HUP INT TERM
   if [ "$completed" -ne 1 ]; then
+    if [ -n "${certificate_journal:-}" ] && ! certificate_state rollback "$certificate_journal"; then
+      red "证书续期文件有并发变更或 Certbot 正忙，未覆盖文件，也未关闭当前验证入口。"
+      red "需人工核对并恢复，备份：$certificate_journal；配置快照：$snapshot"
+      exit 1
+    fi
+    # A newly issued lineage is not deleted on rollback. Keep its validation entry reachable.
+    if [ ! -f "$snapshot/config/.shared-443" ] && [ -f "$CONFIG_DIR/.shared-443" ]; then
+      local dependency_status=0
+      certificate_gateway_required || dependency_status=$?
+      if [ "$dependency_status" -ne 1 ]; then
+        red "仍有新证书依赖当前验证入口，未关闭入口或删除证书；请核对失败原因后重新添加配置。"
+        red "本次未完成，配置快照保留：$snapshot"
+        exit 1
+      fi
+    fi
     cmp -s "$snapshot/config/config.json" "$CONFIG_FILE" || core_changed=1
     id=$(service_container) || recovered=0
     [ "$id" = "$old_id" ] || core_changed=1
@@ -731,7 +1012,7 @@ shared_add_website(){
 }
 
 install_gateway_renewal(){
-  local hook=/etc/letsencrypt/renewal-hooks/deploy/singbox-shared-443.sh
+  local hook="$LETSENCRYPT_DIR/renewal-hooks/deploy/singbox-shared-443.sh"
   mkdir -p "$(dirname "$hook")"
   {
     echo '#!/usr/bin/env bash'
@@ -840,7 +1121,7 @@ issue_letsencrypt_cert(){
   local email="$2"
   local tag="$3"
   local cert_dir="$4"
-  local renew_hook="/etc/letsencrypt/renewal-hooks/deploy/singbox-docker-$tag.sh"
+  local renew_hook="$LETSENCRYPT_DIR/renewal-hooks/deploy/singbox-docker-$tag.sh"
   valid_domain "$domain" && valid_node_tag "$tag" || { red "域名或标签格式无效"; return 1; }
 
   install_certbot
@@ -850,7 +1131,7 @@ issue_letsencrypt_cert(){
   yellow "2. 服务器 80/tcp 已放行；已有共享入口时自动使用其验证目录"
   yellow "3. 云服务器安全组已放行 80/tcp"
 
-  local args=(certonly --non-interactive --agree-tos --preferred-challenges http --cert-name "$domain" -d "$domain")
+  local args=(certonly --config-dir "$LETSENCRYPT_DIR" --non-interactive --agree-tos --preferred-challenges http --cert-name "$domain" -d "$domain")
   if gateway_running; then
     args+=(--webroot -w "$CONFIG_DIR/gateway/acme")
   elif port_used 80 tcp; then
@@ -867,22 +1148,12 @@ issue_letsencrypt_cert(){
   certbot "${args[@]}" || return 1
 
   mkdir -p "$cert_dir"
-  cp "/etc/letsencrypt/live/$domain/fullchain.pem" "$cert_dir/cert.pem"
-  cp "/etc/letsencrypt/live/$domain/privkey.pem" "$cert_dir/private.key"
+  cp "$LETSENCRYPT_DIR/live/$domain/fullchain.pem" "$cert_dir/cert.pem"
+  cp "$LETSENCRYPT_DIR/live/$domain/privkey.pem" "$cert_dir/private.key"
   chmod 600 "$cert_dir/private.key"
 
-  mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-  cat > "$renew_hook" <<EOFHOOK
-#!/usr/bin/env bash
-set -e
-if [ "\$RENEWED_LINEAGE" = "/etc/letsencrypt/live/$domain" ]; then
-  cp "\$RENEWED_LINEAGE/fullchain.pem" "$cert_dir/cert.pem"
-  cp "\$RENEWED_LINEAGE/privkey.pem" "$cert_dir/private.key"
-  chmod 600 "$cert_dir/private.key"
-  cd "$WORK_DIR"
-  docker compose --project-directory "$WORK_DIR" -f "$COMPOSE_FILE" restart sing-box
-fi
-EOFHOOK
+  mkdir -p "$LETSENCRYPT_DIR/renewal-hooks/deploy"
+  legacy_cert_hook_contents "$domain" "$cert_dir" > "$renew_hook"
   chmod +x "$renew_hook"
 }
 
@@ -1933,6 +2204,9 @@ restore_config() (
     tar -tvzf "$file" | awk 'substr($0,1,1) != "-" && substr($0,1,1) != "d" { exit 1 }' || return 1
     tar -xzf "$file" -C "$transaction/staged" --no-same-owner || return 1
     [ -f "$transaction/staged/config/config.json" ] || return 1
+    if [ ! -f "$transaction/staged/config/.shared-443" ]; then
+      certificate_guard_gateway_removal || return 1
+    fi
     image=$(compose_image "$transaction/staged/docker-compose.yml") || return 1
     check_config "$transaction/staged/config/config.json" "$transaction/staged/config" "$image" || return 1
     mv "$CONFIG_DIR" "$transaction/original-config" || return 1
@@ -2193,6 +2467,7 @@ uninstall(){
   if [ -f "$CONFIG_DIR/.shared-443" ]; then yellow "同时关闭脚本管理的 HTTPS 入口；不会删除网站应用的容器或数据。"; fi
   read -rp "确认卸载？输入 y 确认: " c
   if [ "$c" = "y" ]; then
+    certificate_guard_gateway_removal || return 1
     backup_config || true
     if [ -f "$COMPOSE_FILE" ]; then compose rm --stop --force sing-box || return 1; fi
     local gateway_id
@@ -2205,7 +2480,7 @@ uninstall(){
       rm -f /etc/systemd/system/singbox-shared-certificates.timer /etc/systemd/system/singbox-shared-certificates.service
       systemctl daemon-reload || true
     fi
-    rm -f /etc/letsencrypt/renewal-hooks/deploy/singbox-shared-443.sh
+    rm -f "$LETSENCRYPT_DIR/renewal-hooks/deploy/singbox-shared-443.sh"
     green "已卸载，并删除快捷命令 sb"
   else
     yellow "已取消"

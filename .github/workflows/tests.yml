@@ -10,14 +10,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install test dependencies
-        run: sudo apt-get update && sudo apt-get install -y jq iproute2 util-linux shellcheck
+        run: sudo apt-get update && sudo apt-get install -y jq iproute2 util-linux shellcheck python3
       - name: Syntax, failure recovery and static checks
         run: |
           bash -n singbox-docker.sh
           bash -n install.sh
           bash -n tests/shared443.sh
+          bash -n tests/certificate-migration.sh
           bash tests/regression.sh
-          shellcheck -S error singbox-docker.sh tests/regression.sh tests/docker-lifecycle.sh tests/shared443.sh tests/gateway-lifecycle.sh
+          bash tests/certificate-migration.sh
+          shellcheck -S error singbox-docker.sh tests/regression.sh tests/docker-lifecycle.sh tests/shared443.sh tests/gateway-lifecycle.sh tests/certificate-migration.sh
       - name: Test real shared HTTPS, Reality, AnyTLS and Hysteria2
         run: |
           docker build -f tests/Dockerfile.shared -t local/sb-shared-tests .
