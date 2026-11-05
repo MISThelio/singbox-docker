@@ -204,12 +204,140 @@ INPUT
   timeout 5 bash -c 'source "$1"; check_root(){ :; }; main' bash "$ROOT/singbox-docker.sh" </dev/null > /dev/null
 )
 
+delete_fixture(){
+  fixture
+  echo '{"inbounds":[{"tag":"reality-443","type":"vless","listen_port":443,"users":[{"uuid":"SECRET_UUID"}]},{"tag":"hy2-443","type":"hysteria2","listen_port":443}]}' > "$CONFIG_FILE"
+  prepare_runtime(){ :; }
+  ensure_singbox_image(){ echo image >> "$TRACE"; }
+  backup_config(){ echo backup >> "$TRACE"; }
+  apply_config(){ mv "$1" "$CONFIG_FILE"; }
+  remove_info_by_tag(){ printf 'info:%s\n' "$1" >> "$TRACE"; }
+}
+numbered_delete_selects_only_one_node() (
+  delete_fixture
+  delete_inbound <<'INPUT' > "$WORK_DIR/output"
+1
+y
+INPUT
+  jq -e '.inbounds | length == 1 and .[0].tag == "hy2-443"' "$CONFIG_FILE" >/dev/null
+  grep -q '1. reality-443 | vless | TCP 443' "$WORK_DIR/output"
+  grep -q '2. hy2-443 | hysteria2 | UDP 443' "$WORK_DIR/output"
+  ! grep -q SECRET_UUID "$WORK_DIR/output"
+  grep -q '^info:reality-443$' "$TRACE"
+)
+numbered_delete_cancel_is_read_only() (
+  delete_fixture
+  local input
+  for input in 0 $'1\nn' $'1\n'; do
+    delete_inbound <<< "$input" > "$WORK_DIR/output"
+    jq -e '.inbounds | length == 2' "$CONFIG_FILE" >/dev/null
+    [ ! -f "$TRACE" ]
+  done
+)
+numbered_delete_reprompts_invalid_numbers() (
+  delete_fixture
+  delete_inbound <<'INPUT' > "$WORK_DIR/output"
+reality-443
+-1
+3
+99999999999999999999999
+02
+y
+INPUT
+  jq -e '.inbounds | length == 1 and .[0].tag == "reality-443"' "$CONFIG_FILE" >/dev/null
+  [ "$(grep -c '请输入 1-2' "$WORK_DIR/output")" -eq 4 ]
+  grep -q '^info:hy2-443$' "$TRACE"
+)
+numbered_delete_empty_and_eof() (
+  delete_fixture
+  delete_inbound </dev/null > "$WORK_DIR/output"
+  [ ! -f "$TRACE" ]
+  echo '{"inbounds":[]}' > "$CONFIG_FILE"
+  delete_inbound </dev/null > "$WORK_DIR/output"
+  grep -q '当前没有入站节点' "$WORK_DIR/output"
+  [ ! -f "$TRACE" ]
+)
+numbered_delete_shared_route_mapping() (
+  delete_fixture
+  echo '{"domains":{"node.test.example":{"kind":"vless","tag":"reality-443","backend_port":443}}}' > "$CONFIG_DIR/.shared-443"
+  shared_transaction(){ "$@"; }
+  shared_delete_node(){ printf 'shared:%s\n' "$1" >> "$TRACE"; }
+  delete_inbound <<'INPUT' > "$WORK_DIR/output"
+1
+y
+INPUT
+  grep -q node.test.example "$WORK_DIR/output"
+  grep -q '^shared:reality-443$' "$TRACE"
+  ! grep -q '^info:' "$TRACE"
+)
+numbered_delete_rejects_duplicate_tags() (
+  delete_fixture
+  jq '.inbounds[1].tag = "reality-443"' "$CONFIG_FILE" > "$CONFIG_FILE.tmp"
+  mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+  run_menu_action delete_inbound <<'INPUT' > "$WORK_DIR/output"
+1
+y
+INPUT
+  [ "$MENU_ACTION_STATUS" -ne 0 ]; [ ! -f "$TRACE" ]
+  jq -e '.inbounds | length == 2' "$CONFIG_FILE" >/dev/null
+)
+numbered_delete_detects_stale_selection() (
+  delete_fixture
+  ensure_singbox_image(){
+    jq '.inbounds += [{tag:"external-node",type:"vless",listen_port:5446}]' "$CONFIG_FILE" > "$CONFIG_FILE.tmp"
+    mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+  }
+  run_menu_action delete_inbound <<'INPUT' > "$WORK_DIR/output"
+1
+y
+INPUT
+  [ "$MENU_ACTION_STATUS" -ne 0 ]; [ ! -f "$TRACE" ]
+  jq -e '.inbounds | length == 3 and .[0].tag == "reality-443"' "$CONFIG_FILE" >/dev/null
+)
+numbered_delete_handles_numeric_tag() (
+  delete_fixture
+  jq '.inbounds[0].tag = "2"' "$CONFIG_FILE" > "$CONFIG_FILE.tmp"
+  mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+  delete_inbound <<'INPUT' > "$WORK_DIR/output"
+1
+y
+INPUT
+  jq -e '.inbounds | length == 1 and .[0].tag == "hy2-443"' "$CONFIG_FILE" >/dev/null
+  grep -q '^info:2$' "$TRACE"
+)
+numbered_delete_backup_failure_is_safe() (
+  delete_fixture
+  backup_config(){ return 1; }
+  apply_config(){ touch "$WORK_DIR/unsafe-apply"; }
+  run_menu_action delete_inbound <<'INPUT' > "$WORK_DIR/output"
+1
+y
+INPUT
+  [ "$MENU_ACTION_STATUS" -ne 0 ]; [ ! -f "$WORK_DIR/unsafe-apply" ]
+  jq -e '.inbounds | length == 2' "$CONFIG_FILE" >/dev/null
+  ! grep -q '^info:' "$TRACE"
+)
+numbered_delete_apply_failure_preserves_info() (
+  delete_fixture
+  apply_config(){ return 1; }
+  run_menu_action delete_inbound <<'INPUT' > "$WORK_DIR/output"
+1
+y
+INPUT
+  [ "$MENU_ACTION_STATUS" -ne 0 ]
+  jq -e '.inbounds | length == 2' "$CONFIG_FILE" >/dev/null
+  ! grep -q '^info:' "$TRACE"
+)
+
 for test in back_navigation_has_no_pause actions_pause_once unhandled_failure_stops_action_not_menu \
   explicit_exit_is_contained retry_addition failure_returns_to_add_menu real_domain_failure_allows_retry \
   invalid_port_is_failure occupied_port_is_failure other_menu_errors_are_contained \
   initialization_failure_does_not_start_service port_conflict_is_read_only_and_explained \
   empty_migration_does_not_enable_gateway certificate_menu_and_private_summary eof_returns_from_submenus \
-  cli_navigation_and_eof; do
+  cli_navigation_and_eof numbered_delete_selects_only_one_node numbered_delete_cancel_is_read_only \
+  numbered_delete_reprompts_invalid_numbers numbered_delete_empty_and_eof numbered_delete_shared_route_mapping \
+  numbered_delete_rejects_duplicate_tags numbered_delete_detects_stale_selection numbered_delete_handles_numeric_tag \
+  numbered_delete_backup_failure_is_safe numbered_delete_apply_failure_preserves_info; do
   run_test "$test"
 done
 echo "$passed menu interaction tests passed"

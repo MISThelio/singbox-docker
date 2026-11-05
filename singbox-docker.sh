@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
-SCRIPT_VERSION="2026.11.06.4"
+SCRIPT_VERSION="2026.11.06.5"
 
 SING_BOX_VERSION="${SING_BOX_VERSION:-latest}"
 SING_BOX_IMAGE="${SING_BOX_IMAGE:-ghcr.io/sagernet/sing-box:${SING_BOX_VERSION}}"
@@ -1818,17 +1818,52 @@ EOFINFO
 
 delete_inbound(){
   prepare_runtime || return
-  ensure_singbox_image || return
+  local entries count choice index selected tag confirm checksum current_checksum row domain port network
+  checksum=$(sha256sum "$CONFIG_FILE" | awk '{print $1}') || return 1
+  entries=$(jq -ce '[.inbounds[]? | {tag,type,listen_port,network}]' "$CONFIG_FILE") || return 1
+  count=$(jq length <<< "$entries") || return 1
+  if [ "$count" -eq 0 ]; then yellow "当前没有入站节点"; return 0; fi
 
-  show_inbounds
-  echo
-  read -rp "请输入要删除的入站标签: " tag
-  [ -n "$tag" ] || { red "标签不能为空"; return; }
-
-  if ! tag_exists "$tag"; then
-    red "标签 $tag 不存在"
-    return
+  echo "请选择要删除的入站："
+  index=0
+  while IFS= read -r row; do
+    index=$((index + 1))
+    tag=$(jq -r '.tag // ""' <<< "$row")
+    port=$(jq -r '.listen_port // "-"' <<< "$row")
+    network=$(jq -r '(.network // (if .type == "hysteria2" or .type == "tuic" then "udp"
+      elif .type == "vless" or .type == "anytls" or .type == "trojan" then "tcp"
+      else "tcp/udp" end)) | ascii_upcase' <<< "$row")
+    domain=$(shared_domain_for_tag "$tag" 2>/dev/null || true)
+    if [ -n "$domain" ]; then
+      printf '%s. %s | %s | %s 443（内部 %s）| %s\n' "$index" "$tag" "$(jq -r '.type' <<< "$row")" "$network" "$port" "$domain"
+    else
+      printf '%s. %s | %s | %s %s\n' "$index" "$tag" "$(jq -r '.type' <<< "$row")" "$network" "$port"
+    fi
+  done < <(jq -c '.[]' <<< "$entries")
+  echo "0. 取消"
+  while true; do
+    read -rp "请输入编号: " choice || return 0
+    if [[ "$choice" =~ ^[0-9]{1,9}$ ]]; then
+      index=$((10#$choice))
+      [ "$index" -ne 0 ] || return 0
+      if [ "$index" -le "$count" ]; then break; fi
+    fi
+    red "请输入 1-$count 的编号，或输入 0 取消"
+  done
+  selected=$(jq -ce --argjson index "$index" '.[$index-1]' <<< "$entries") || return 1
+  tag=$(jq -er '.tag | select(type == "string" and length > 0)' <<< "$selected") || {
+    red "该入站缺少有效标签，不能安全删除"; return 1;
+  }
+  if [ "$(jq --arg tag "$tag" '[.[] | select(.tag == $tag)] | length' <<< "$entries")" -ne 1 ]; then
+    red "配置中有重复标签 $tag，不能按标签安全删除，请先修复配置"; return 1
   fi
+  printf '将删除：%s | %s | 配置端口 %s\n' "$tag" "$(jq -r '.type' <<< "$selected")" "$(jq -r '.listen_port // "-"' <<< "$selected")"
+  read -rp "确认删除该入站？输入 y [默认取消]: " confirm || return 0
+  [ "$confirm" = y ] || { yellow "已取消删除"; return 0; }
+
+  ensure_singbox_image || return 1
+  current_checksum=$(sha256sum "$CONFIG_FILE" | awk '{print $1}') || return 1
+  [ "$checksum" = "$current_checksum" ] || { red "配置已发生变化，未删除任何入站，请重新打开删除列表"; return 1; }
 
   backup_config || return 1
   if shared_domain_for_tag "$tag" >/dev/null; then
