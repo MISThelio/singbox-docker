@@ -2,6 +2,14 @@
 set -Eeuo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 source "$ROOT/singbox-docker.sh"
+if [ "${SB_TEST_LOOPBACK:-0}" = 1 ]; then
+  eval "$(declare -f gateway_render | sed '1s/gateway_render/render_test_gateway/')"
+  gateway_render(){
+    render_test_gateway "$1" || return 1
+    sed -i -e 's/listen 443;/listen 127.0.0.1:443;/g' -e 's/listen \[::\]:443;/listen [::1]:443;/g' \
+      -e 's/listen 80;/listen 127.0.0.1:80;/g' -e 's/listen \[::\]:80;/listen [::1]:80;/g' "$1"
+  }
+fi
 WORK_DIR=$(mktemp -d)
 CONFIG_DIR="$WORK_DIR/config"; CONFIG_FILE="$CONFIG_DIR/config.json"
 COMPOSE_FILE="$WORK_DIR/docker-compose.yml"; INFO_FILE="$WORK_DIR/nodes.txt"
@@ -22,7 +30,7 @@ printf '%s\n' '{"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}]}' >
 jq -n --arg image "$SING_BOX_IMAGE" '{services:{"sing-box":{image:$image,network_mode:"host",volumes:["./config:/etc/sing-box","./data:/var/lib/sing-box"],command:["-C","/etc/sing-box","run"]}}}' > "$COMPOSE_FILE"
 printf '' > "$INFO_FILE"
 # Certificate issuance is tested without contacting a public CA or installing host timers.
-install_gateway_renewal(){ :; }; open_port(){ :; }
+install_gateway_renewal(){ :; }; open_port(){ :; }; prepare_runtime(){ :; }
 new_certificate(){
   openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK_DIR/new-key.pem" -out "$WORK_DIR/new-cert.pem" \
     -days 1 -subj /CN=www.test.example \
@@ -69,7 +77,7 @@ $WORK_DIR/source-cert.pem
 $WORK_DIR/source-key.pem
 INPUT
 check_website(){
-  curl -fsS --noproxy '*' --cacert "$WORK_DIR/source-cert.pem" \
+  curl -fsS --retry 4 --retry-delay 1 --retry-all-errors --max-time 5 --noproxy '*' --cacert "$WORK_DIR/source-cert.pem" \
     --resolve www.test.example:443:127.0.0.1 https://www.test.example/ | grep -q fixture-website
 }
 check_website
@@ -119,6 +127,7 @@ echo 'PASS real certificate rotation preserves all three container IDs'
 backup_config
 archive=$(find "$BACKUP_DIR" -name '*.tar.gz' | head -n 1)
 shared_transaction shared_remove_website www.test.example
+sleep 1
 if check_website; then echo 'FAIL removed website is still routed'; exit 1; fi
 restore_config <<INPUT
 $archive

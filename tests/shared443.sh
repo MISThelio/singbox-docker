@@ -65,7 +65,13 @@ add_inbound(){
 gateway_apply(){ :; }; install_gateway_renewal(){ :; }; open_port(){ :; }
 shared_add_node vless vless.test.example <<< ''
 shared_add_node anytls anytls.test.example <<< $'\np"@:/?&$'
+gateway_certificate hy2.test.example
+jq --arg cert "$TEST_ROOT/cert.pem" --arg key "$TEST_ROOT/key.pem" \
+  '.domains["hy2.test.example"]={kind:"website",source_cert:$cert,source_key:$key,website_upstream:"http://127.0.0.1:18080"}' \
+  "$CONFIG_DIR/.shared-443" > "$CONFIG_DIR/.state-next"
+mv "$CONFIG_DIR/.state-next" "$CONFIG_DIR/.shared-443"
 shared_add_node hysteria2 hy2.test.example <<< $'\n'
+jq -e '.domains["hy2.test.example"].kind == "hysteria2" and .domains["hy2.test.example"].website_upstream == "http://127.0.0.1:18080"' "$CONFIG_DIR/.shared-443" >/dev/null
 if shared_add_node hysteria2 second-hy2.test.example <<< $'\n'; then echo 'Duplicate UDP 443 accepted'; exit 1; fi
 jq -e 'all(.inbounds[]; if .type == "hysteria2" then .listen_port == 443 else .listen == "127.0.0.1" and .listen_port != 443 end)' "$CONFIG_FILE" >/dev/null
 grep -q '@anytls.test.example:443?' "$INFO_FILE"
@@ -94,6 +100,9 @@ sleep 1
 curl -fsS --noproxy '*' --cacert "$TEST_ROOT/cert.pem" --resolve www.test.example:443:127.0.0.1 \
   https://www.test.example/ | grep -q fixture-website
 echo 'PASS real HTTPS website on TCP 443'
+curl -fsS --noproxy '*' --cacert "$TEST_ROOT/cert.pem" --resolve hy2.test.example:443:127.0.0.1 \
+  https://hy2.test.example/ | grep -q fixture-website
+echo 'PASS existing website domain also serves HTTPS alongside Hy2'
 
 for kind in vless anytls hysteria2; do
   domain=$(jq -r --arg kind "$kind" '.domains | to_entries[] | select(.value.kind == $kind) | .key' "$CONFIG_DIR/.shared-443")

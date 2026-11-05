@@ -636,10 +636,13 @@ shared_cleanup(){
 }
 
 shared_add_node(){
-  local kind="$1" domain="$2" state="$CONFIG_DIR/.shared-443" backend tag password="" uuid="" short_id="" key_output private_key="" public_key="" tls_port inbound tmp uri password_uri
+  local kind="$1" domain="$2" state="$CONFIG_DIR/.shared-443" backend tag password="" uuid="" short_id="" key_output private_key="" public_key="" tls_port inbound tmp uri password_uri existing_kind
   valid_domain "$domain" || { red "域名格式无效，请填写小写完整域名，不含协议和端口"; return 1; }
   gateway_initialize || return 1
-  if jq -e --arg d "$domain" '.domains | has($d)' "$state" >/dev/null; then red "该域名已被共享入口使用，请使用另一个子域名"; return 1; fi
+  existing_kind=$(jq -r --arg d "$domain" '.domains[$d].kind // empty' "$state") || return 1
+  if [ -n "$existing_kind" ] && { [ "$kind" != hysteria2 ] || [ "$existing_kind" != website ]; }; then
+    red "该域名已被共享入口使用；TCP 节点请使用另一个子域名"; return 1
+  fi
   if [ "$kind" = hysteria2 ] && port_used 443 udp; then
     red "443/UDP 已被占用；请复用现有 Hy2 入站，或留空域名使用其他 UDP 端口。"; return 1
   fi
@@ -649,7 +652,13 @@ shared_add_node(){
   tag=${tmp:-$tag}
   valid_node_tag "$tag" && ! tag_exists "$tag" || { red "标签已存在或格式无效（仅字母、数字、点、横线和下划线，最多64字符）"; return 1; }
   ensure_singbox_image || return 1
-  gateway_certificate "$domain" || return 1
+  if [ "$existing_kind" = website ]; then
+    GW_SOURCE_CERT=$(jq -er --arg d "$domain" '.domains[$d].source_cert' "$state") || return 1
+    GW_SOURCE_KEY=$(jq -er --arg d "$domain" '.domains[$d].source_key' "$state") || return 1
+    validate_certificate "$domain" "$CONFIG_DIR/gateway/certs/$domain/cert.pem" "$CONFIG_DIR/gateway/certs/$domain/private.key" || return 1
+  else
+    gateway_certificate "$domain" || return 1
+  fi
   tls_port=$(jq -r '.tls_port' "$state")
   if [ "$kind" = vless ]; then
     uuid=$(uuidgen); short_id=$(openssl rand -hex 8)
@@ -670,7 +679,7 @@ shared_add_node(){
         else {certificate_path:("/etc/sing-box/gateway/certs/"+$domain+"/cert.pem"),key_path:("/etc/sing-box/gateway/certs/"+$domain+"/private.key")} end)}') || return 1
   tmp=$(mktemp "$CONFIG_DIR/.gateway-state.XXXXXX") || return 1
   jq --arg domain "$domain" --arg kind "$kind" --arg tag "$tag" --arg cert "$GW_SOURCE_CERT" --arg key "$GW_SOURCE_KEY" --argjson port "$backend" \
-    '.domains[$domain]={kind:$kind,tag:$tag,backend_port:$port,source_cert:$cert,source_key:$key}' "$state" > "$tmp" || return 1
+    '.domains[$domain]=((.domains[$domain] // {}) + {kind:$kind,tag:$tag,backend_port:$port,source_cert:$cert,source_key:$key})' "$state" > "$tmp" || return 1
   mv "$tmp" "$state" || return 1
   add_inbound "$inbound" || return 1
   gateway_apply || return 1
