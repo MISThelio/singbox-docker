@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
-SCRIPT_VERSION="2026.11.06.3"
+SCRIPT_VERSION="2026.11.06.4"
 
 SING_BOX_VERSION="${SING_BOX_VERSION:-latest}"
 SING_BOX_IMAGE="${SING_BOX_IMAGE:-ghcr.io/sagernet/sing-box:${SING_BOX_VERSION}}"
@@ -30,7 +30,33 @@ check_root(){
 
 pause(){
   echo
-  read -rp "按回车继续..."
+  read -rp "按回车继续..." || true
+}
+
+clear_menu(){
+  if [ -t 1 ]; then clear 2>/dev/null || true; fi
+}
+
+run_menu_action(){
+  # Do not put the action in an if/|| condition: Bash would disable errexit in its functions.
+  set +e
+  ( set -Eeuo pipefail; "$@" )
+  MENU_ACTION_STATUS=$?
+  set -e
+  if [ "$MENU_ACTION_STATUS" -ne 0 ]; then
+    yellow "本次操作未完成（状态 $MENU_ACTION_STATUS），可以继续使用菜单。"
+  fi
+  return 0
+}
+
+retry_menu_action(){
+  local retry
+  while true; do
+    run_menu_action "$@"
+    if [ "$MENU_ACTION_STATUS" -eq 0 ]; then pause; return 0; fi
+    read -rp "重新填写并重试？输入 y；直接回车返回菜单: " retry || return 0
+    [ "$retry" = y ] || return 0
+  done
 }
 
 need_cmd(){
@@ -43,7 +69,7 @@ install_shortcut(){
   else
     install -m 0755 "$0" "$SCRIPT_PATH"
   fi
-  green "快捷命令已安装：sb"
+  if [ "${1:-}" != quiet ]; then green "快捷命令已安装：sb"; fi
 }
 
 install_packages(){
@@ -103,7 +129,7 @@ JSON
 
 write_compose_file(){
   if [ -f "$COMPOSE_FILE" ]; then
-    yellow "已存在 docker-compose.yml，跳过覆盖"
+    if [ "${1:-}" != quiet ]; then yellow "已存在 docker-compose.yml，跳过覆盖"; fi
     return
   fi
 
@@ -250,8 +276,8 @@ prepare_runtime(){
 
   mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$BACKUP_DIR"
   write_default_config
-  write_compose_file
-  install_shortcut
+  write_compose_file quiet
+  install_shortcut quiet
 }
 
 ensure_singbox_image(){
@@ -643,6 +669,7 @@ gateway_preflight(){
       if port_used "$port" tcp; then
         red "$port/TCP 已被占用，不能自动启用共享入口；不会停止或修改现有网站。"
         yellow "已有网站需先安排迁移到本机其他 HTTP 端口，再接入网站管理。"
+        show_gateway_port_owner "$port"
         return 1
       fi
     done
@@ -655,6 +682,18 @@ gateway_preflight(){
       red "发现尚未迁移的 standalone 证书：$name；请从添加配置流程确认迁移。"; return 1
     fi
   done < <(jq -r '.[] | select(.params.authenticator == "standalone") | [.name,.sha] | @tsv' <<< "$inventory")
+}
+
+show_gateway_port_owner(){
+  local port="$1"
+  echo "宿主机 $port/TCP 监听情况（只查看，不会停止服务）："
+  ss -lntp "( sport = :$port )" || true
+  echo "本配置中使用该 TCP 端口的入站："
+  jq -r --argjson port "$port" '.inbounds[] | select(.listen_port == $port) |
+    select(.type != "hysteria2" and .type != "tuic" and .network != "udp") |
+    [.tag,.type,(.listen_port | tostring)] | @tsv' "$CONFIG_FILE" || true
+  yellow "当前工作目录：$WORK_DIR。若是另一套 sb 安装或网站占用，请先确认其用途，不要直接停止或删除。"
+  yellow "证书迁移只修改续期方式，不会腾出 443。若已有入站使用 TCP 443，应先将其改用独立端口；若是网站，先将网站后端改到本机其他 HTTP 端口，再接入共享入口。"
 }
 
 allocate_private_port(){
@@ -1065,6 +1104,45 @@ sync_shared_certificates(){
   fi
 }
 
+shared_migrate_certificates(){
+  local inventory
+  inventory=$(certificate_inventory) || return 1
+  if ! jq -e 'any(.[]; .params.authenticator == "standalone")' <<< "$inventory" >/dev/null; then
+    yellow "没有需要迁移的 standalone 证书；可查看证书续期方式。"
+    return 0
+  fi
+  gateway_initialize || return 1
+  install_gateway_renewal || return 1
+  green "旧证书续期已迁移，共享入口已启用；现有节点的域名和端口未修改。"
+}
+
+migrate_certificates_action(){
+  prepare_runtime
+  run_locked shared_transaction shared_migrate_certificates
+}
+
+show_certificate_status(){
+  local inventory
+  inventory=$(certificate_inventory) || return 1
+  if [ "$(jq length <<< "$inventory")" -eq 0 ]; then yellow "未找到 Certbot 续期配置"; return 0; fi
+  echo "证书名称 / 续期方式 / 验证目录（不显示私钥或账号信息）"
+  jq -r '.[] | [.name,(.params.authenticator // "未知"),
+    ([.params.webroot_path // empty, (.webroot_map[]?)] | unique | join("; "))] | @tsv' <<< "$inventory"
+  yellow "standalone 需要独占 80/TCP；webroot 使用网站验证目录；dns-* 由对应 DNS 插件验证。"
+  yellow "本脚本只自动迁移能确认归属的旧证书。其他工具管理的证书，请在原工具中改为 webroot/DNS 后导入。"
+}
+
+shared_website_action(){
+  prepare_runtime
+  run_locked shared_transaction shared_add_website
+}
+
+repair_shared_renewal(){
+  [ -f "$CONFIG_DIR/.shared-443" ] || { yellow "尚未启用共享入口"; return 1; }
+  run_locked shared_transaction sync_shared_certificates
+  install_gateway_renewal
+}
+
 shared_gateway_menu(){
   local choice domain state="$CONFIG_DIR/.shared-443"
   while true; do
@@ -1074,15 +1152,19 @@ shared_gateway_menu(){
     echo "2. 查看共享域名与内部端口"
     echo "3. 删除网站接入"
     echo "4. 同步续期证书 / 修复续期任务"
+    echo "5. 迁移旧证书续期到共享入口"
+    echo "6. 查看证书续期方式"
     echo "0. 返回"
-    read -rp "请选择: " choice
+    read -rp "请选择: " choice || return 0
     case "$choice" in
-      1) prepare_runtime && run_locked shared_transaction shared_add_website; pause ;;
-      2) if [ -f "$state" ]; then jq '.domains | to_entries | map({domain:.key,type:.value.kind,public_port:443,internal_port:.value.backend_port,website:.value.website_upstream})' "$state"; else yellow "尚未启用共享入口"; fi; pause ;;
+      1) retry_menu_action shared_website_action ;;
+      2) if [ -f "$state" ]; then run_menu_action jq '.domains | to_entries | map({domain:.key,type:.value.kind,public_port:443,internal_port:.value.backend_port,website:.value.website_upstream})' "$state"; else yellow "尚未启用共享入口"; fi; pause ;;
       3)
-        read -rp "要移除网站接入的域名: " domain
-        if [ -f "$state" ]; then run_locked shared_transaction shared_remove_website "$domain"; fi; pause ;;
-      4) if [ -f "$state" ]; then run_locked shared_transaction sync_shared_certificates && install_gateway_renewal; fi; pause ;;
+        read -rp "要移除网站接入的域名: " domain || return 0
+        if [ -f "$state" ]; then run_menu_action run_locked shared_transaction shared_remove_website "$domain"; fi; pause ;;
+      4) run_menu_action repair_shared_renewal; pause ;;
+      5) retry_menu_action migrate_certificates_action ;;
+      6) run_menu_action show_certificate_status; pause ;;
       0) break ;;
       *) red "无效选择" ;;
     esac
@@ -1325,7 +1407,7 @@ read_port(){
   read -rp "$prompt" port
   port="${port:-$default}"
   [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || {
-    red "端口必须是 1-65535 的数字"
+    red "端口必须是 1-65535 的数字" >&2
     return 1
   }
   printf '%s' "$port"
@@ -1346,14 +1428,14 @@ add_reality(){
 
   if port_used "$port" tcp; then
     red "端口 $port 可能已被占用，请换一个端口"
-    return
+    return 1
   fi
 
   read -rp "节点标签 [默认 reality-$port]: " tag
   tag=${tag:-reality-$port}
   if tag_exists "$tag"; then
     red "标签 $tag 已存在，请换一个标签"
-    return
+    return 1
   fi
 
   read -rp "伪装域名 SNI [默认 www.microsoft.com]: " sni
@@ -1436,14 +1518,14 @@ add_hysteria2(){
 
   if port_used "$port" udp; then
     red "端口 $port 可能已被占用，请换一个端口"
-    return
+    return 1
   fi
 
   read -rp "节点标签 [默认 hy2-$port]: " tag
   tag=${tag:-hy2-$port}
   if tag_exists "$tag"; then
     red "标签 $tag 已存在，请换一个标签"
-    return
+    return 1
   fi
 
   ensure_singbox_image || return
@@ -1474,7 +1556,7 @@ add_hysteria2(){
       ;;
     2)
       read -rp "证书域名，例如 hy2.example.com: " sni
-      [ -n "$sni" ] || { red "证书域名不能为空"; return; }
+      [ -n "$sni" ] || { red "证书域名不能为空"; return 1; }
       read -rp "Let's Encrypt 邮箱 [可留空]: " email
       issue_letsencrypt_cert "$sni" "$email" "$tag" "$cert_dir" || return
       cert_note="Let's Encrypt 真实证书"
@@ -1482,7 +1564,7 @@ add_hysteria2(){
       ;;
     *)
       red "证书模式只能选择 1 或 2"
-      return
+      return 1
       ;;
   esac
 
@@ -1556,14 +1638,14 @@ add_anytls(){
 
   if port_used "$port" tcp; then
     red "端口 $port 可能已被占用，请换一个端口"
-    return
+    return 1
   fi
 
   read -rp "节点标签 [默认 anytls-$port]: " tag
   tag=${tag:-anytls-$port}
   if tag_exists "$tag"; then
     red "标签 $tag 已存在，请换一个标签"
-    return
+    return 1
   fi
 
   ensure_singbox_image || return
@@ -1594,7 +1676,7 @@ add_anytls(){
       ;;
     2)
       read -rp "证书域名，例如 anytls.example.com: " sni
-      [ -n "$sni" ] || { red "证书域名不能为空"; return; }
+      [ -n "$sni" ] || { red "证书域名不能为空"; return 1; }
       read -rp "Let's Encrypt 邮箱 [可留空]: " email
       issue_letsencrypt_cert "$sni" "$email" "$tag" "$cert_dir" || return
       cert_note="Let's Encrypt 真实证书"
@@ -1602,7 +1684,7 @@ add_anytls(){
       ;;
     *)
       red "证书模式只能选择 1 或 2"
-      return
+      return 1
       ;;
   esac
 
@@ -1681,13 +1763,13 @@ add_door(){
   tag=${tag:-door-$port}
   if tag_exists "$tag"; then
     red "标签 $tag 已存在，请换一个标签"
-    return
+    return 1
   fi
 
   ensure_singbox_image || return
 
   read -rp "转发目标地址，例如 1.1.1.1 或 example.com: " target
-  [ -n "$target" ] || { red "目标地址不能为空"; return; }
+  [ -n "$target" ] || { red "目标地址不能为空"; return 1; }
 
   target_port=$(read_port "转发目标端口，例如 443: " "") || return
 
@@ -1695,7 +1777,7 @@ add_door(){
   network=${network:-tcp}
   case "$network" in
     tcp|udp) ;;
-    *) red "网络类型只能是 tcp 或 udp"; return ;;
+    *) red "网络类型只能是 tcp 或 udp"; return 1 ;;
   esac
   if port_used "$port" "$network"; then
     red "端口 $port/$network 已被占用，请换一个端口"
@@ -2032,7 +2114,7 @@ EOFANYTLS
 
 add_config_menu(){
   while true; do
-    clear
+    clear_menu
     echo "======================================"
     echo " 添加配置"
     echo "======================================"
@@ -2043,13 +2125,13 @@ add_config_menu(){
     echo "5. 共享 443 / 网站管理"
     echo "0. 返回主菜单"
     echo "======================================"
-    read -rp "请选择: " a
+    read -rp "请选择: " a || return 0
 
     case "$a" in
-      1) run_locked add_reality; pause ;;
-      2) run_locked add_hysteria2; pause ;;
-      3) run_locked add_anytls; pause ;;
-      4) run_locked add_door; pause ;;
+      1) retry_menu_action run_locked add_reality ;;
+      2) retry_menu_action run_locked add_hysteria2 ;;
+      3) retry_menu_action run_locked add_anytls ;;
+      4) retry_menu_action run_locked add_door ;;
       5) shared_gateway_menu ;;
       0) break ;;
       *) red "无效选择"; pause ;;
@@ -2059,7 +2141,7 @@ add_config_menu(){
 
 config_menu(){
   while true; do
-    clear
+    clear_menu
     echo "======================================"
     echo " 配置查看 / 检查"
     echo "======================================"
@@ -2071,15 +2153,15 @@ config_menu(){
     echo "6. 检查配置"
     echo "0. 返回主菜单"
     echo "======================================"
-    read -rp "请选择: " c
+    read -rp "请选择: " c || return 0
 
     case "$c" in
-      1) show_info; pause ;;
-      2) show_hysteria2_links; pause ;;
-      3) show_anytls_links; pause ;;
-      4) show_inbounds; pause ;;
-      5) show_config; pause ;;
-      6) check_config; pause ;;
+      1) run_menu_action show_info; pause ;;
+      2) run_menu_action show_hysteria2_links; pause ;;
+      3) run_menu_action show_anytls_links; pause ;;
+      4) run_menu_action show_inbounds; pause ;;
+      5) run_menu_action show_config; pause ;;
+      6) run_menu_action check_config; pause ;;
       0) break ;;
       *) red "无效选择"; pause ;;
     esac
@@ -2307,9 +2389,14 @@ EOFBBR
   fi
 }
 
+initialize_and_start(){
+  install_base
+  start_service
+}
+
 system_menu(){
   while true; do
-    clear
+    clear_menu
     echo "======================================"
     echo " 系统优化"
     echo "======================================"
@@ -2318,12 +2405,12 @@ system_menu(){
     echo "3. 初始化/修复 sing-box Docker 环境"
     echo "0. 返回主菜单"
     echo "======================================"
-    read -rp "请选择: " s
+    read -rp "请选择: " s || return 0
 
     case "$s" in
-      1) show_bbr_status; pause ;;
-      2) enable_bbr; pause ;;
-      3) install_base; start_service; pause ;;
+      1) run_menu_action show_bbr_status; pause ;;
+      2) run_menu_action enable_bbr; pause ;;
+      3) run_menu_action initialize_and_start; pause ;;
       0) break ;;
       *) red "无效选择"; pause ;;
     esac
@@ -2435,7 +2522,7 @@ update_script(){
 
 update_menu(){
   while true; do
-    clear
+    clear_menu
     echo "======================================"
     echo " sing-box 更新管理"
     echo "======================================"
@@ -2447,15 +2534,15 @@ update_menu(){
     echo "6. 安装/修复快捷命令 sb"
     echo "0. 返回主菜单"
     echo "======================================"
-    read -rp "请选择: " u
+    read -rp "请选择: " u || return 0
 
     case "$u" in
-      1) run_locked update_singbox_image; pause ;;
-      2) show_version; pause ;;
-      3) backup_config; pause ;;
-      4) run_locked restore_config; pause ;;
-      5) update_script; pause ;;
-      6) install_shortcut; pause ;;
+      1) run_menu_action run_locked update_singbox_image; pause ;;
+      2) run_menu_action show_version; pause ;;
+      3) run_menu_action backup_config; pause ;;
+      4) run_menu_action run_locked restore_config; pause ;;
+      5) run_menu_action update_script; pause ;;
+      6) run_menu_action install_shortcut; pause ;;
       0) break ;;
       *) red "无效选择"; pause ;;
     esac
@@ -2488,7 +2575,7 @@ uninstall(){
 }
 
 menu(){
-  clear
+  clear_menu
   echo "======================================"
   echo " sing-box Docker 多入站管理脚本"
   echo " 脚本版本：$SCRIPT_VERSION"
@@ -2507,20 +2594,20 @@ menu(){
   echo "11. 卸载"
   echo "0. 退出"
   echo "======================================"
-  read -rp "请选择: " num
+  read -rp "请选择: " num || exit 0
 
   case "$num" in
-    1) add_config_menu ;;
-    2) run_locked delete_inbound ;;
-    3) config_menu ;;
-    4) run_locked start_service ;;
-    5) run_locked restart_service ;;
-    6) run_locked stop_service ;;
-    7) logs ;;
-    8) update_menu ;;
-    9) system_menu ;;
-    10) install_shortcut ;;
-    11) uninstall ;;
+    1) add_config_menu; return 0 ;;
+    2) run_menu_action run_locked delete_inbound ;;
+    3) config_menu; return 0 ;;
+    4) run_menu_action run_locked start_service ;;
+    5) run_menu_action run_locked restart_service ;;
+    6) run_menu_action run_locked stop_service ;;
+    7) run_menu_action logs ;;
+    8) update_menu; return 0 ;;
+    9) system_menu; return 0 ;;
+    10) run_menu_action install_shortcut ;;
+    11) run_menu_action uninstall ;;
     0) exit 0 ;;
     *) red "无效选择" ;;
   esac

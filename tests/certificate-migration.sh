@@ -258,6 +258,22 @@ INPUT
   if uninstall <<< y; then exit 1; fi
   [ -f "$WORK_DIR/running" ]; [ -f "$CONFIG_DIR/.shared-443" ]
 )
+menu_action_preserves_rollback() (
+  fixture; legacy old.test.example hy2-old
+  operation(){ gateway_initialize || return 1; return 9; }
+  run_menu_action shared_transaction operation <<< y
+  [ "$MENU_ACTION_STATUS" -ne 0 ]
+  unchanged old.test.example
+)
+explicit_migration_action() (
+  fixture; legacy old.test.example hy2-old
+  prepare_runtime(){ :; }
+  install_gateway_renewal(){ touch "$WORK_DIR/renewal-installed"; }
+  run_menu_action migrate_certificates_action <<< y
+  [ "$MENU_ACTION_STATUS" -eq 0 ]
+  [ -f "$WORK_DIR/renewal-installed" ]
+  certificate_uses_gateway old.test.example "$(certificate_inventory)"
+)
 certbot_lock() (
   fixture; legacy old.test.example hy2-old
   python3 - "$LETSENCRYPT_DIR" <<'PYLOCK' &
@@ -281,7 +297,7 @@ PYLOCK
 for test in managed_success declined unknown_owner wrong_fingerprint unsafe_hooks old_certbot partial_failure \
   staging_failure later_failure disconnect_after_migration concurrent_change occupied_port empty_inventory \
   map_only_webroot unknown_new_renewal_keeps_entry changed_after_approval symlink_renewal_refused \
-  restore_and_uninstall_preserve_validation certbot_lock; do
+  restore_and_uninstall_preserve_validation menu_action_preserves_rollback explicit_migration_action certbot_lock; do
   run_test "$test"
 done
 echo "$passed certificate migration tests passed"
