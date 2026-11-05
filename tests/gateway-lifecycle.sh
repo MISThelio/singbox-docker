@@ -56,8 +56,10 @@ INPUT
 echo 'PASS additional SNI route preserves both container IDs'
 
 website_port=$(allocate_private_port)
+printf 'events {}\nhttp { access_log off; server { listen 127.0.0.1:%s; root /www; } }\n' "$website_port" > "$WORK_DIR/website-nginx.conf"
 docker run -d --name "$website_name" --network host -v "$WORK_DIR/site:/www:ro" \
-  alpine:3.22 httpd -f -p "127.0.0.1:$website_port" -h /www >/dev/null
+  -v "$WORK_DIR/website-nginx.conf:/etc/nginx/nginx.conf:ro" --entrypoint nginx \
+  "$NGINX_IMAGE" -g 'daemon off;' >/dev/null
 website_id=$(docker inspect --format '{{.Id}}' "$website_name")
 shared_transaction shared_add_website <<INPUT
 www.test.example
