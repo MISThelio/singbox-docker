@@ -63,14 +63,20 @@ add_inbound(){
   mv "$CONFIG_FILE.next" "$CONFIG_FILE"
 }
 gateway_apply(){ :; }; install_gateway_renewal(){ :; }; open_port(){ :; }
-shared_add_node vless vless.test.example <<< ''
-shared_add_node anytls anytls.test.example <<< $'\np"@:/?&$'
+shared_add_node vless vless.test.example <<< '' > "$TEST_ROOT/vless-output"
+shared_add_node anytls anytls.test.example <<< $'\np"@:/?&$' > "$TEST_ROOT/anytls-output"
 gateway_certificate hy2.test.example
 jq --arg cert "$TEST_ROOT/cert.pem" --arg key "$TEST_ROOT/key.pem" \
   '.domains["hy2.test.example"]={kind:"website",source_cert:$cert,source_key:$key,website_upstream:"http://127.0.0.1:18080"}' \
   "$CONFIG_DIR/.shared-443" > "$CONFIG_DIR/.state-next"
 mv "$CONFIG_DIR/.state-next" "$CONFIG_DIR/.shared-443"
-shared_add_node hysteria2 hy2.test.example <<< $'\n'
+shared_add_node hysteria2 hy2.test.example <<< $'\n' > "$TEST_ROOT/hy2-output"
+grep -q '@vless.test.example:443?' "$TEST_ROOT/vless-output"
+grep -q 'UUID：' "$TEST_ROOT/vless-output"
+grep -q 'PublicKey：' "$TEST_ROOT/vless-output"
+grep -q 'ShortID：' "$TEST_ROOT/vless-output"
+grep -q '@anytls.test.example:443?' "$TEST_ROOT/anytls-output"
+grep -q '@hy2.test.example:443?' "$TEST_ROOT/hy2-output"
 jq -e '.domains["hy2.test.example"].kind == "hysteria2" and .domains["hy2.test.example"].website_upstream == "http://127.0.0.1:18080"' "$CONFIG_DIR/.shared-443" >/dev/null
 if shared_add_node hysteria2 second-hy2.test.example <<< $'\n'; then echo 'Duplicate UDP 443 accepted'; exit 1; fi
 jq -e 'all(.inbounds[]; if .type == "hysteria2" then .listen_port == 443 else .listen == "127.0.0.1" and .listen_port != 443 end)' "$CONFIG_FILE" >/dev/null

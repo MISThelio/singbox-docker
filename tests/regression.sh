@@ -311,13 +311,46 @@ shared_delete_preserves_website() (
   jq -e '.domains["node.test"].kind == "website" and .domains["node.test"].tag == null and .domains["other.test"].tag == "other"' "$CONFIG_DIR/.shared-443" >/dev/null
 )
 
+creation_prints_current_node() (
+  fixture
+  local kind="$1" input expected
+  prepare_runtime(){ :; }; ensure_singbox_image(){ :; }; port_used(){ return 1; }; tag_exists(){ return 1; }
+  public_ip(){ echo 203.0.113.10; }; runtime_image(){ echo fixture; }; open_port(){ :; }
+  docker(){ printf 'PrivateKey: PRIVATE_MUST_NOT_PRINT\nPublicKey: PUBLIC_FIXTURE\n'; }
+  add_inbound(){ jq --argjson inbound "$1" '.inbounds += [$inbound]' "$CONFIG_FILE" > "$CONFIG_FILE.next"; mv "$CONFIG_FILE.next" "$CONFIG_FILE"; }
+  printf '\n==============================\n标签：unrelated\n密码：UNRELATED_MUST_NOT_PRINT\n==============================\n' >> "$INFO_FILE"
+  case "$kind" in
+    reality) input=$'\n5446\nnode-reality\nwww.microsoft.com'; expected='vless://' ;;
+    hysteria2) input=$'\n8443\nnode-hysteria2\nfixture-password\n1\nbing.com'; expected='hysteria2://' ;;
+    anytls) input=$'\n8444\nnode-anytls\nfixture-password\n1\nwww.microsoft.com'; expected='anytls://' ;;
+    door) input=$'2080\nnode-door\nexample.com\n443\ntcp'; expected='example.com:443' ;;
+  esac
+  "add_$kind" <<< "$input" > "$WORK_DIR/output"
+  grep -q "标签：node-$kind" "$WORK_DIR/output"
+  grep -q "$expected" "$WORK_DIR/output"
+  ! grep -q 'PRIVATE_MUST_NOT_PRINT\|UNRELATED_MUST_NOT_PRINT' "$WORK_DIR/output"
+)
+
+failed_creation_prints_no_node() (
+  fixture
+  prepare_runtime(){ :; }; ensure_singbox_image(){ :; }; port_used(){ return 1; }; tag_exists(){ return 1; }
+  public_ip(){ echo 203.0.113.10; }; runtime_image(){ echo fixture; }
+  docker(){ printf 'PrivateKey: PRIVATE_FIXTURE\nPublicKey: PUBLIC_FIXTURE\n'; }
+  add_inbound(){ return 1; }
+  if add_reality <<< $'\n5446\nfailed-node\nwww.microsoft.com' > "$WORK_DIR/output"; then exit 1; fi
+  ! grep -q 'vless://\|本次节点配置' "$WORK_DIR/output"
+  [ "$(cat "$INFO_FILE")" = original-info ]
+)
+
 for test in reject_candidate commit_candidate rollback_candidate rollback_on_disconnect \
   backup_failure backup_without_info regular_restart_keeps_container validate_running_image \
   protocol_specific_ports find_renamed_container recover_deleted_container restore_failure readiness_rejects_crash \
   backup_integrity_failure update_requires_backup failed_recovery_retains_evidence stop_replacement_before_recovery \
-  shared_operation_rollback shared_preflight_failure_is_non_disruptive shared_refuses_unmanaged_ports shared_delete_preserves_website; do
+  shared_operation_rollback shared_preflight_failure_is_non_disruptive shared_refuses_unmanaged_ports shared_delete_preserves_website \
+  failed_creation_prints_no_node; do
   run_test "$test"
 done
+for kind in reality hysteria2 anytls door; do run_test creation_prints_current_node "$kind"; done
 for phase in pull validate replace; do run_test update_failure "$phase"; done
 run_test restore_failure validate
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then

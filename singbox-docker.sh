@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
-SCRIPT_VERSION="2026.11.06.1"
+SCRIPT_VERSION="2026.11.06.2"
 
 SING_BOX_VERSION="${SING_BOX_VERSION:-latest}"
 SING_BOX_IMAGE="${SING_BOX_IMAGE:-ghcr.io/sagernet/sing-box:${SING_BOX_VERSION}}"
@@ -689,13 +689,22 @@ shared_add_node(){
     password_uri=$(uri_escape "$password")
     uri="$kind://$password_uri@$domain:443?sni=$domain#$(uri_escape "$tag")"
   fi
-  printf '\n==============================\n类型：%s\n标签：%s\n地址：%s\n端口：443\n内部端口：%s\nSNI：%s\n链接：\n%s\n==============================\n' \
-    "$kind" "$tag" "$domain" "$backend" "$domain" "$uri" >> "$INFO_FILE"
+  {
+    printf '\n==============================\n类型：%s\n标签：%s\n地址：%s\n端口：443\n内部端口：%s\nSNI：%s\n' \
+      "$kind" "$tag" "$domain" "$backend" "$domain"
+    if [ "$kind" = vless ]; then
+      printf 'UUID：%s\nFlow：xtls-rprx-vision\nPublicKey：%s\nShortID：%s\n' "$uuid" "$public_key" "$short_id"
+    else
+      printf '密码：%s\n' "$password"
+    fi
+    printf '链接：\n%s\n==============================\n' "$uri"
+  } >> "$INFO_FILE"
   install_gateway_renewal || return 1
   open_port 80 tcp
   open_port 443 tcp
   [ "$kind" != hysteria2 ] || open_port 443 udp
   green "共享 443 入站已添加；内部端口仅监听本机，不需要对公网放行"
+  print_created_node "$tag"
 }
 
 shared_add_website(){
@@ -932,6 +941,14 @@ remove_info_by_tag(){
   mv "$tmp" "$INFO_FILE"
 }
 
+print_created_node(){
+  local block
+  block=$(latest_info_block_by_tag "$1") || { red "节点信息读取失败，请通过配置查看菜单核对"; return 1; }
+  echo
+  yellow "本次节点配置（含连接凭据，请勿公开）："
+  printf '%s\n' "$block"
+}
+
 check_config(){
   local file="${1:-$CONFIG_FILE}" directory="${2:-$CONFIG_DIR}" image
   image="${3:-$(runtime_image)}" || return 1
@@ -1046,7 +1063,7 @@ read_port(){
 add_reality(){
   prepare_runtime || return
   local shared_domain
-  read -rp "共享 443 域名 [留空使用独立端口]: " shared_domain
+  read -rp "绑定节点域名（先解析到本机）[填写后共享443；留空独立端口]: " shared_domain
   if [ -n "$shared_domain" ]; then
     shared_transaction shared_add_node vless "$shared_domain"
     return $?
@@ -1131,12 +1148,13 @@ EOFINFO
 
   open_port "$port" tcp
   green "VLESS Reality 入站已添加"
+  print_created_node "$tag"
 }
 
 add_hysteria2(){
   prepare_runtime || return
   local shared_domain
-  read -rp "共享 443 域名 [留空使用独立端口]: " shared_domain
+  read -rp "绑定节点域名（先解析到本机）[填写后共享443；留空独立端口]: " shared_domain
   if [ -n "$shared_domain" ]; then
     shared_transaction shared_add_node hysteria2 "$shared_domain"
     return $?
@@ -1250,12 +1268,13 @@ EOFINFO
 
   open_port "$port" udp
   green "Hysteria2 入站已添加"
+  print_created_node "$tag"
 }
 
 add_anytls(){
   prepare_runtime || return
   local shared_domain
-  read -rp "共享 443 域名 [留空使用独立端口]: " shared_domain
+  read -rp "绑定节点域名（先解析到本机）[填写后共享443；留空独立端口]: " shared_domain
   if [ -n "$shared_domain" ]; then
     shared_transaction shared_add_node anytls "$shared_domain"
     return $?
@@ -1378,6 +1397,7 @@ EOFINFO
 
   open_port "$port" tcp
   green "AnyTLS 入站已添加"
+  print_created_node "$tag"
 }
 
 add_door(){
@@ -1440,6 +1460,7 @@ EOFINFO
 
   open_port "$port" "$network"
   green "Door 转发入站已添加"
+  print_created_node "$tag"
 }
 
 delete_inbound(){
