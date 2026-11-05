@@ -530,7 +530,7 @@ gateway_apply(){
   tmp=$(mktemp "$CONFIG_DIR/gateway/.nginx.XXXXXX") || return 1
   gateway_render "$tmp" || { rm -f "$tmp"; return 1; }
   docker run --rm --entrypoint nginx -v "$CONFIG_DIR/gateway:/etc/sb-gateway:ro" \
-    -v "$tmp:/etc/sb-gateway/nginx.conf:ro" "$image" -t -c /etc/sb-gateway/nginx.conf || { rm -f "$tmp"; return 1; }
+    "$image" -t -c "/etc/sb-gateway/${tmp##*/}" || { rm -f "$tmp"; return 1; }
   mv "$tmp" "$CONFIG_DIR/gateway/nginx.conf" || return 1
   if gateway_running; then
     docker exec "$(gateway_container)" nginx -s reload -c /etc/sb-gateway/nginx.conf || return 1
