@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
-SCRIPT_VERSION="2026.11.05.1"
+SCRIPT_VERSION="2026.11.06.1"
 
 SING_BOX_VERSION="${SING_BOX_VERSION:-latest}"
 SING_BOX_IMAGE="${SING_BOX_IMAGE:-ghcr.io/sagernet/sing-box:${SING_BOX_VERSION}}"
@@ -17,6 +17,7 @@ DEFAULT_SCRIPT_URL="https://api.github.com/repos/MISThelio/singbox-docker/conten
 FALLBACK_SCRIPT_URL="https://raw.githubusercontent.com/MISThelio/singbox-docker/main/singbox-docker.sh"
 SCRIPT_URL="${SCRIPT_URL:-$DEFAULT_SCRIPT_URL}"
 SCRIPT_ACCEPT="${SCRIPT_ACCEPT:-application/vnd.github.raw}"
+NGINX_IMAGE="${NGINX_IMAGE:-nginx:stable-alpine}"
 
 green(){ printf '\033[32m%s\033[0m\n' "$1"; }
 yellow(){ printf '\033[33m%s\033[0m\n' "$1"; }
@@ -333,6 +334,471 @@ cert_is_self_signed(){
   [ -n "$subject" ] && [ "$subject" = "$issuer" ]
 }
 
+valid_domain(){
+  local domain="$1" label
+  [[ ${#domain} -le 253 && "$domain" == *.* && "$domain" != *..* && "$domain" != *. ]] || return 1
+  local labels
+  IFS=. read -ra labels <<< "$domain"
+  for label in "${labels[@]}"; do
+    [[ "$label" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || return 1
+  done
+}
+
+valid_node_tag(){
+  [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$ ]]
+}
+
+validate_certificate(){
+  local domain="$1" cert="$2" key="$3" cert_public key_public
+  [ -r "$cert" ] && [ -r "$key" ] || { red "证书或私钥不可读"; return 1; }
+  openssl x509 -in "$cert" -noout -checkhost "$domain" >/dev/null 2>&1 || {
+    red "证书不匹配域名：$domain"; return 1;
+  }
+  openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1 || return 1
+  # Trusting the leaf here checks its validity dates, not its public CA trust chain.
+  openssl verify -verify_hostname "$domain" -partial_chain -trusted "$cert" "$cert" >/dev/null 2>&1 || return 1
+  cert_public=$(openssl x509 -in "$cert" -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256) || return 1
+  key_public=$(openssl pkey -in "$key" -passin pass: -pubout -outform DER | openssl dgst -sha256) || return 1
+  [ "$cert_public" = "$key_public" ] || { red "证书与私钥不匹配"; return 1; }
+}
+
+shared_domain_for_tag(){
+  [ -f "$CONFIG_DIR/.shared-443" ] || return 1
+  jq -er --arg tag "$1" '.domains | to_entries[] | select(.value.tag == $tag) | .key' "$CONFIG_DIR/.shared-443"
+}
+
+gateway_container(){
+  local ids
+  ids=$(docker ps -a -q --filter "label=com.docker.compose.project.working_dir=$WORK_DIR" \
+    --filter label=com.docker.compose.service=singbox-gateway --filter label=io.singbox-docker.gateway=true) || return 1
+  [ -n "$ids" ] || return 0
+  docker inspect $ids | jq -r 'sort_by(.State.Running, .State.StartedAt) | last | .Id // empty'
+}
+
+gateway_running(){
+  local id
+  id=$(gateway_container) || return 1
+  [ -n "$id" ] && [ "$(docker inspect --format '{{.State.Running}}' "$id")" = true ]
+}
+
+gateway_preflight(){
+  local port existing renewal
+  existing=$(compose config --format json | jq -r '.services["singbox-gateway"].labels["io.singbox-docker.gateway"] // empty') || return 1
+  [ -z "$existing" ] || [ "$existing" = true ] || return 1
+  if compose config --format json | jq -e '.services | has("singbox-gateway")' >/dev/null; then
+    [ "$existing" = true ] || { red "singbox-gateway 服务名称已被其他配置占用"; return 1; }
+  fi
+  if ! gateway_running; then
+    for renewal in /etc/letsencrypt/renewal/*.conf; do
+      if [ -f "$renewal" ] && grep -Eq '^[[:space:]]*authenticator[[:space:]]*=[[:space:]]*standalone[[:space:]]*$' "$renewal"; then
+        red "发现依赖独占 80/TCP 的已有证书续期：$renewal"
+        yellow "请先将该证书改为 DNS 或持续可用的网站目录验证，再启用共享入口，避免破坏旧证书续期。"
+        return 1
+      fi
+    done
+    for port in 80 443; do
+      if port_used "$port" tcp; then
+        red "$port/TCP 已被占用，不能自动启用共享入口；不会停止或修改现有网站。"
+        yellow "已有网站需先安排迁移到本机其他 HTTP 端口，再接入网站管理。"
+        return 1
+      fi
+    done
+  fi
+}
+
+allocate_private_port(){
+  local port attempt
+  for ((attempt=0; attempt<100; attempt++)); do
+    port=$((20000 + RANDOM % 20000))
+    if port_used "$port" tcp || port_used "$port" udp; then continue; fi
+    if [ -f "$CONFIG_DIR/.shared-443" ] && jq -e --argjson p "$port" \
+      '.tls_port == $p or any(.domains[]; .backend_port == $p)' "$CONFIG_DIR/.shared-443" >/dev/null; then continue; fi
+    printf '%s' "$port"
+    return 0
+  done
+  red "未找到空闲内部端口" >&2
+  return 1
+}
+
+gateway_initialize(){
+  local state="$CONFIG_DIR/.shared-443" tls_port flags
+  gateway_preflight || return 1
+  if [ -f "$state" ]; then
+    if ! gateway_running; then gateway_apply || return 1; fi
+    return 0
+  fi
+  docker image inspect "$NGINX_IMAGE" >/dev/null 2>&1 || docker pull "$NGINX_IMAGE" || return 1
+  flags=$(docker run --rm --entrypoint nginx "$NGINX_IMAGE" -V 2>&1) || return 1
+  [[ "$flags" == *--with-stream_ssl_preread_module* ]] || { red "Nginx 镜像不支持 SNI 分流"; return 1; }
+  tls_port=$(allocate_private_port) || return 1
+  mkdir -p "$CONFIG_DIR/gateway/acme" "$CONFIG_DIR/gateway/certs"
+  chmod 755 "$CONFIG_DIR/gateway" "$CONFIG_DIR/gateway/acme"
+  jq -n --arg image "$NGINX_IMAGE" --argjson tls_port "$tls_port" \
+    --argjson dynamic "$(if [[ "$flags" == *--with-stream=dynamic* ]]; then echo true; else echo false; fi)" \
+    '{version:1,nginx_image:$image,tls_port:$tls_port,dynamic_stream:$dynamic,domains:{}}' > "$state"
+  # Bootstrap HTTP-01 before issuing certificates; renewals then keep using webroot, never standalone.
+  gateway_apply
+}
+
+gateway_certificate(){
+  local domain="$1" cert_dir="$CONFIG_DIR/gateway/certs/$1" choice email=""
+  GW_SOURCE_CERT="/etc/letsencrypt/live/$domain/fullchain.pem"
+  GW_SOURCE_KEY="/etc/letsencrypt/live/$domain/privkey.pem"
+  echo "证书来源：1. 自动申请 / 复用 Let's Encrypt（默认）  2. 导入已有证书"
+  read -rp "请选择 [默认 1]: " choice
+  case "${choice:-1}" in
+      1)
+        install_certbot || return 1
+        open_port 80 tcp
+        if validate_certificate "$domain" "$GW_SOURCE_CERT" "$GW_SOURCE_KEY" >/dev/null 2>&1; then
+          certbot reconfigure --cert-name "$domain" --webroot -w "$CONFIG_DIR/gateway/acme" --non-interactive || return 1
+        else
+        local args=(certonly --non-interactive --agree-tos --preferred-challenges http --cert-name "$domain" -d "$domain")
+        read -rp "Let's Encrypt 邮箱 [可留空]: " email
+        if [ -n "$email" ]; then args+=(-m "$email"); else args+=(--register-unsafely-without-email); fi
+        args+=(--webroot -w "$CONFIG_DIR/gateway/acme")
+        yellow "请确认域名已直接解析到本机，且云安全组和系统防火墙允许 80/TCP"
+        certbot "${args[@]}" || return 1
+        fi
+        ;;
+      2)
+        read -rp "宿主机证书完整链绝对路径: " GW_SOURCE_CERT
+        read -rp "宿主机私钥绝对路径: " GW_SOURCE_KEY
+        [[ "$GW_SOURCE_CERT" = /* && "$GW_SOURCE_KEY" = /* ]] || { red "请使用绝对路径"; return 1; }
+        yellow "原证书管理器仍负责续期；若它使用 standalone 验证，请先改为 DNS 或网站目录验证。"
+        ;;
+      *) return 1 ;;
+  esac
+  validate_certificate "$domain" "$GW_SOURCE_CERT" "$GW_SOURCE_KEY" || return 1
+  mkdir -p "$cert_dir"
+  install -m 0600 "$GW_SOURCE_CERT" "$cert_dir/cert.pem" || return 1
+  install -m 0600 "$GW_SOURCE_KEY" "$cert_dir/private.key" || return 1
+  validate_certificate "$domain" "$cert_dir/cert.pem" "$cert_dir/private.key"
+}
+
+gateway_render(){
+  local state="$CONFIG_DIR/.shared-443" output="$1" tls_port domain kind port upstream
+  jq -e '.version == 1 and (.tls_port | type == "number") and (.domains | type == "object")' "$state" >/dev/null || return 1
+  tls_port=$(jq -r '.tls_port' "$state")
+  [[ "$tls_port" =~ ^[0-9]+$ ]] && [ "$tls_port" -ge 1024 ] && [ "$tls_port" -le 65535 ] || return 1
+  {
+    if [ "$(jq -r '.dynamic_stream' "$state")" = true ]; then echo 'load_module /usr/lib/nginx/modules/ngx_stream_module.so;'; fi
+    printf 'worker_processes auto;\nerror_log /dev/stderr warn;\npid /tmp/nginx.pid;\nevents { worker_connections 2048; }\n'
+    printf 'stream {\n log_format ingress "$remote_addr $ssl_preread_server_name $status $bytes_sent $bytes_received $session_time";\n access_log /dev/stdout ingress;\n map $ssl_preread_server_name $destination {\n default 127.0.0.1:%s;\n' "$tls_port"
+    while IFS=$'\t' read -r domain kind port; do
+      valid_domain "$domain" || return 1
+      case "$kind" in
+        vless|anytls)
+          [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ] || return 1
+          printf ' %s 127.0.0.1:%s;\n' "$domain" "$port" ;;
+        hysteria2|website) : ;;
+        *) return 1 ;;
+      esac
+    done < <(jq -r '.domains | to_entries | sort_by(.key)[] | [.key,.value.kind,(.value.backend_port // 0)] | @tsv' "$state")
+    printf ' }\n server { listen 443; listen [::]:443; ssl_preread on; proxy_connect_timeout 5s; proxy_timeout 1h; proxy_pass $destination; }\n}\n'
+    printf 'http {\n access_log off;\n server_tokens off;\n client_max_body_size 64m;\n map $http_upgrade $upgrade_connection { default upgrade; "" close; }\n'
+    printf ' server { listen 80; listen [::]:80; server_name _; location /.well-known/acme-challenge/ { root /etc/sb-gateway/acme; } location / { return 404; } }\n'
+    printf ' server { listen 127.0.0.1:%s ssl default_server; ssl_reject_handshake on; }\n' "$tls_port"
+    while IFS=$'\t' read -r domain upstream; do
+      valid_domain "$domain" || return 1
+      printf ' server { listen 127.0.0.1:%s ssl; server_name %s;\n' "$tls_port" "$domain"
+      printf ' ssl_certificate /etc/sb-gateway/certs/%s/cert.pem; ssl_certificate_key /etc/sb-gateway/certs/%s/private.key;\n' "$domain" "$domain"
+      printf ' ssl_protocols TLSv1.2 TLSv1.3;\n'
+      if [ -n "$upstream" ]; then
+        valid_website_upstream "$upstream" || return 1
+        printf ' location / { proxy_pass %s; proxy_http_version 1.1; proxy_buffering off; proxy_read_timeout 300s; proxy_send_timeout 300s; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection $upgrade_connection; }\n' "$upstream"
+      else
+        printf ' location / { return 404; }\n'
+      fi
+      printf ' }\n'
+    done < <(jq -r '.domains | to_entries | sort_by(.key)[] | [.key,(.value.website_upstream // "")] | @tsv' "$state")
+    printf '}\n'
+  } > "$output"
+}
+
+valid_website_upstream(){
+  local port
+  [[ "$1" =~ ^http://(127\.0\.0\.1|\[::1\]):([0-9]{1,5})/?$ ]] || return 1
+  port="${BASH_REMATCH[2]}"
+  [ "$port" -ge 1 ] && [ "$port" -le 65535 ] && [ "$port" -ne 80 ] && [ "$port" -ne 443 ]
+}
+
+gateway_apply(){
+  local state="$CONFIG_DIR/.shared-443" image tmp id
+  [ -f "$state" ] || return 0
+  image=$(jq -er '.nginx_image' "$state") || return 1
+  tmp=$(mktemp "$CONFIG_DIR/gateway/.nginx.XXXXXX") || return 1
+  gateway_render "$tmp" || { rm -f "$tmp"; return 1; }
+  docker run --rm --entrypoint nginx -v "$CONFIG_DIR/gateway:/etc/sb-gateway:ro" \
+    -v "$tmp:/etc/sb-gateway/nginx.conf:ro" "$image" -t -c /etc/sb-gateway/nginx.conf || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$CONFIG_DIR/gateway/nginx.conf" || return 1
+  if gateway_running; then
+    docker exec "$(gateway_container)" nginx -s reload -c /etc/sb-gateway/nginx.conf || return 1
+  else
+    gateway_preflight || return 1
+    tmp=$(mktemp "$WORK_DIR/.gateway-compose.XXXXXX") || return 1
+    if ! compose config --no-interpolate --no-env-resolution --no-path-resolution --format json | jq \
+      --arg image "$image" --arg source "$CONFIG_DIR/gateway" '
+      .services["singbox-gateway"] = {image:$image,restart:"unless-stopped",network_mode:"host",
+        labels:{"io.singbox-docker.gateway":"true"},entrypoint:["nginx"],
+        command:["-c","/etc/sb-gateway/nginx.conf","-g","daemon off;"],
+        volumes:[{type:"bind",source:$source,target:"/etc/sb-gateway",read_only:true}],
+        logging:{driver:"json-file",options:{"max-size":"10m","max-file":"3"}}}' > "$tmp"; then
+      rm -f "$tmp"; return 1
+    fi
+    docker compose --project-directory "$WORK_DIR" -f "$tmp" config -q || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$COMPOSE_FILE" || return 1
+    if [ "${1:-}" = restore ]; then
+      compose up -d --no-deps --force-recreate singbox-gateway || return 1
+    else
+      compose up -d --no-deps singbox-gateway || return 1
+    fi
+    id=$(gateway_container) || return 1
+    [ -n "$id" ] && wait_service "$id" || return 1
+  fi
+}
+
+restore_gateway_service(){
+  local id
+  id=$(gateway_container) || return 1
+  [ -z "$id" ] || docker stop "$id" >/dev/null || return 1
+  if [ -f "$CONFIG_DIR/.shared-443" ]; then
+    gateway_apply restore || return 1
+    install_gateway_renewal || return 1
+  fi
+}
+
+shared_transaction() (
+  local snapshot completed=0 old_id old_image="" gateway_id gateway_was_running=0 core_was_running=0
+  snapshot=$(mktemp -d "$WORK_DIR/.shared-operation.XXXXXX") || return 1
+  cp -a "$CONFIG_DIR" "$snapshot/config" || return 1
+  cp -p "$COMPOSE_FILE" "$snapshot/compose" || return 1
+  [ ! -f "$INFO_FILE" ] || cp -p "$INFO_FILE" "$snapshot/info" || return 1
+  old_id=$(service_container) || return 1
+  if [ -n "$old_id" ]; then
+    old_image=$(docker inspect --format '{{.Image}}' "$old_id") || return 1
+    [ "$(docker inspect --format '{{.State.Running}}' "$old_id")" != true ] || core_was_running=1
+  fi
+  gateway_id=$(gateway_container) || return 1
+  if gateway_running; then gateway_was_running=1; fi
+  trap shared_cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  "$@" || return 1
+  completed=1
+)
+
+shared_cleanup(){
+  local result=$? id recovered=1 core_changed=0 gateway_changed=0
+  trap - EXIT HUP INT TERM
+  if [ "$completed" -ne 1 ]; then
+    cmp -s "$snapshot/config/config.json" "$CONFIG_FILE" || core_changed=1
+    id=$(service_container) || recovered=0
+    [ "$id" = "$old_id" ] || core_changed=1
+    if [ -n "$id" ] && [ "$(docker inspect --format '{{.State.Running}}' "$id")" != "$(if [ "$core_was_running" -eq 1 ]; then echo true; else echo false; fi)" ]; then core_changed=1; fi
+    if [ -f "$snapshot/config/gateway/nginx.conf" ] || [ -f "$CONFIG_DIR/gateway/nginx.conf" ]; then
+      cmp -s "$snapshot/config/gateway/nginx.conf" "$CONFIG_DIR/gateway/nginx.conf" || gateway_changed=1
+    fi
+    id=$(gateway_container) || recovered=0
+    [ "$id" = "$gateway_id" ] || gateway_changed=1
+    # Keep the mounted config directory inode; replacing it would leave running containers on old files.
+    cp -a "$snapshot/config/." "$CONFIG_DIR/" || recovered=0
+    for id in .shared-443 gateway/nginx.conf; do
+      if [ ! -f "$snapshot/config/$id" ]; then rm -f "$CONFIG_DIR/$id" || recovered=0; fi
+    done
+    cp -p "$snapshot/compose" "$COMPOSE_FILE" || recovered=0
+    if [ -f "$snapshot/info" ]; then cp -p "$snapshot/info" "$INFO_FILE" || recovered=0; else rm -f "$INFO_FILE"; fi
+    if [ "$core_changed" -eq 1 ] && [ -n "$old_image" ]; then
+      recover_service "$old_id" "$old_image" || recovered=0
+      if [ "$core_was_running" -eq 0 ]; then docker stop "$old_id" >/dev/null || recovered=0; fi
+    elif [ "$core_changed" -eq 1 ]; then
+      id=$(service_container) || recovered=0
+      [ -z "$id" ] || docker rm -f "$id" >/dev/null || recovered=0
+    fi
+    if [ "$gateway_changed" -eq 1 ] && [ "$gateway_was_running" -eq 1 ]; then
+      if gateway_running; then
+        docker exec "$gateway_id" nginx -s reload -c /etc/sb-gateway/nginx.conf || recovered=0
+      else
+        docker start "$gateway_id" >/dev/null && wait_service "$gateway_id" || recovered=0
+      fi
+    elif [ "$gateway_changed" -eq 1 ]; then
+      id=$(gateway_container) || recovered=0
+      if [ -n "$id" ] && [ "$id" != "$gateway_id" ]; then docker rm -f "$id" >/dev/null || recovered=0; fi
+      if [ -n "$id" ] && [ "$id" = "$gateway_id" ]; then docker stop "$id" >/dev/null || recovered=0; fi
+    fi
+    [ "$result" -ne 0 ] || result=1
+    if [ "$recovered" -ne 1 ]; then red "自动恢复未完成，备份保留：$snapshot"; exit 1; fi
+    red "共享入口操作失败，已恢复原配置和服务"
+  fi
+  rm -rf "$snapshot"
+  exit "$result"
+}
+
+shared_add_node(){
+  local kind="$1" domain="$2" state="$CONFIG_DIR/.shared-443" backend tag password="" uuid="" short_id="" key_output private_key="" public_key="" tls_port inbound tmp uri password_uri
+  valid_domain "$domain" || { red "域名格式无效，请填写小写完整域名，不含协议和端口"; return 1; }
+  gateway_initialize || return 1
+  if jq -e --arg d "$domain" '.domains | has($d)' "$state" >/dev/null; then red "该域名已被共享入口使用，请使用另一个子域名"; return 1; fi
+  if [ "$kind" = hysteria2 ] && port_used 443 udp; then
+    red "443/UDP 已被占用；请复用现有 Hy2 入站，或留空域名使用其他 UDP 端口。"; return 1
+  fi
+  if [ "$kind" = hysteria2 ]; then backend=443; else backend=$(allocate_private_port) || return 1; fi
+  tag="$kind-$backend"
+  read -rp "节点标签 [默认 $tag]: " tmp
+  tag=${tmp:-$tag}
+  valid_node_tag "$tag" && ! tag_exists "$tag" || { red "标签已存在或格式无效（仅字母、数字、点、横线和下划线，最多64字符）"; return 1; }
+  ensure_singbox_image || return 1
+  gateway_certificate "$domain" || return 1
+  tls_port=$(jq -r '.tls_port' "$state")
+  if [ "$kind" = vless ]; then
+    uuid=$(uuidgen); short_id=$(openssl rand -hex 8)
+    key_output=$(docker run --rm "$(runtime_image)" generate reality-keypair) || return 1
+    private_key=$(printf '%s\n' "$key_output" | awk '/PrivateKey/ {print $2}')
+    public_key=$(printf '%s\n' "$key_output" | awk '/PublicKey/ {print $2}')
+    [ -n "$private_key" ] && [ -n "$public_key" ] || return 1
+  else
+    read -rp "密码 [留空自动生成]: " password
+    password=${password:-$(openssl rand -hex 16)}
+  fi
+  inbound=$(jq -n --arg type "$kind" --arg tag "$tag" --arg domain "$domain" --arg password "$password" \
+    --arg uuid "$uuid" --arg private_key "$private_key" --arg sid "$short_id" --argjson port "$backend" --argjson tls_port "$tls_port" '
+    {type:$type,tag:$tag,listen:(if $type == "hysteria2" then "::" else "127.0.0.1" end),listen_port:$port,
+      users:[(if $type == "vless" then {uuid:$uuid,flow:"xtls-rprx-vision"} else {name:$tag,password:$password} end)],
+      tls:({enabled:true,server_name:$domain} +
+        if $type == "vless" then {reality:{enabled:true,handshake:{server:"127.0.0.1",server_port:$tls_port},private_key:$private_key,short_id:[$sid]}}
+        else {certificate_path:("/etc/sing-box/gateway/certs/"+$domain+"/cert.pem"),key_path:("/etc/sing-box/gateway/certs/"+$domain+"/private.key")} end)}') || return 1
+  tmp=$(mktemp "$CONFIG_DIR/.gateway-state.XXXXXX") || return 1
+  jq --arg domain "$domain" --arg kind "$kind" --arg tag "$tag" --arg cert "$GW_SOURCE_CERT" --arg key "$GW_SOURCE_KEY" --argjson port "$backend" \
+    '.domains[$domain]={kind:$kind,tag:$tag,backend_port:$port,source_cert:$cert,source_key:$key}' "$state" > "$tmp" || return 1
+  mv "$tmp" "$state" || return 1
+  add_inbound "$inbound" || return 1
+  gateway_apply || return 1
+  if [ "$kind" = vless ]; then
+    uri="vless://$uuid@$domain:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$domain&fp=chrome&pbk=$public_key&sid=$short_id&type=tcp#$(uri_escape "$tag")"
+  else
+    password_uri=$(uri_escape "$password")
+    uri="$kind://$password_uri@$domain:443?sni=$domain#$(uri_escape "$tag")"
+  fi
+  printf '\n==============================\n类型：%s\n标签：%s\n地址：%s\n端口：443\n内部端口：%s\nSNI：%s\n链接：\n%s\n==============================\n' \
+    "$kind" "$tag" "$domain" "$backend" "$domain" "$uri" >> "$INFO_FILE"
+  install_gateway_renewal || return 1
+  open_port 80 tcp
+  open_port 443 tcp
+  [ "$kind" != hysteria2 ] || open_port 443 udp
+  green "共享 443 入站已添加；内部端口仅监听本机，不需要对公网放行"
+}
+
+shared_add_website(){
+  prepare_runtime || return 1
+  local domain upstream state="$CONFIG_DIR/.shared-443" tmp kind
+  read -rp "网站域名（已解析到本机）: " domain
+  valid_domain "$domain" || { red "域名格式无效"; return 1; }
+  read -rp "网站本机 HTTP 地址，例如 http://127.0.0.1:8080: " upstream
+  valid_website_upstream "$upstream" || { red "仅支持本机 HTTP 地址，不能使用 80 或 443，避免入口循环"; return 1; }
+  gateway_initialize || return 1
+  kind=$(jq -r --arg d "$domain" '.domains[$d].kind // empty' "$state")
+  case "$kind" in
+    vless|anytls) red "TCP 节点与网站请使用不同子域名，以便网站不依赖节点运行"; return 1 ;;
+  esac
+  if [ -z "$kind" ]; then gateway_certificate "$domain" || return 1; fi
+  tmp=$(mktemp "$CONFIG_DIR/.gateway-state.XXXXXX") || return 1
+  jq --arg d "$domain" --arg upstream "$upstream" --arg cert "${GW_SOURCE_CERT:-}" --arg key "${GW_SOURCE_KEY:-}" \
+    '.domains[$d] = ((.domains[$d] // {kind:"website",source_cert:$cert,source_key:$key}) + {website_upstream:$upstream})' "$state" > "$tmp" || return 1
+  mv "$tmp" "$state" || return 1
+  gateway_apply || return 1
+  install_gateway_renewal || return 1
+  open_port 80 tcp; open_port 443 tcp
+  green "网站已接入 HTTPS 443；原应用仍运行在原来的本机 HTTP 端口"
+}
+
+install_gateway_renewal(){
+  local hook=/etc/letsencrypt/renewal-hooks/deploy/singbox-shared-443.sh
+  mkdir -p "$(dirname "$hook")"
+  {
+    echo '#!/usr/bin/env bash'
+    printf 'exec env WORK_DIR=%q SCRIPT_PATH=%q %q --sync-shared-certificates\n' "$WORK_DIR" "$SCRIPT_PATH" "$SCRIPT_PATH"
+  } > "$hook"
+  chmod 700 "$hook"
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    # Polling also supports certificates renewed by Caddy/acme.sh instead of Certbot.
+    printf '[Unit]\nDescription=Sync sing-box shared HTTPS certificates\n[Service]\nType=oneshot\nExecStart=%s\n' "$hook" > /etc/systemd/system/singbox-shared-certificates.service
+    printf '[Unit]\nDescription=Check shared HTTPS certificates\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=5min\n[Install]\nWantedBy=timers.target\n' > /etc/systemd/system/singbox-shared-certificates.timer
+    systemctl daemon-reload || return 1
+    systemctl enable --now singbox-shared-certificates.timer || return 1
+    if command -v certbot >/dev/null 2>&1; then
+      if systemctl cat certbot.timer >/dev/null 2>&1; then
+        systemctl enable --now certbot.timer || return 1
+      elif systemctl cat certbot-renew.timer >/dev/null 2>&1; then
+        systemctl enable --now certbot-renew.timer || return 1
+      else
+        yellow "未发现 Certbot 续期定时器，请确认原系统已有 certbot renew 定时任务。"
+      fi
+    fi
+  else
+    yellow "此系统未运行 systemd，请在原证书管理器续期后执行：$SCRIPT_PATH --sync-shared-certificates"
+  fi
+}
+
+sync_shared_certificates(){
+  local state="$CONFIG_DIR/.shared-443" domain source_cert source_key destination staged changed=0
+  [ -f "$state" ] || return 0
+  while IFS= read -r domain; do
+    valid_domain "$domain" || return 1
+    source_cert=$(jq -er --arg d "$domain" '.domains[$d].source_cert' "$state") || return 1
+    source_key=$(jq -er --arg d "$domain" '.domains[$d].source_key' "$state") || return 1
+    destination="$CONFIG_DIR/gateway/certs/$domain"
+    if ! validate_certificate "$domain" "$source_cert" "$source_key"; then
+      red "续期证书尚不可用，未替换：$domain"; return 1
+    fi
+    if cmp -s "$source_cert" "$destination/cert.pem" && cmp -s "$source_key" "$destination/private.key"; then continue; fi
+    staged=$(mktemp -d "$destination/.renew.XXXXXX") || return 1
+    install -m 0600 "$source_cert" "$staged/cert.pem" && install -m 0600 "$source_key" "$staged/private.key" || return 1
+    validate_certificate "$domain" "$staged/cert.pem" "$staged/private.key" || return 1
+    mv "$staged/private.key" "$destination/private.key" && mv "$staged/cert.pem" "$destination/cert.pem" || return 1
+    rmdir "$staged"
+    changed=1
+  done < <(jq -r '.domains | keys[]' "$state")
+  if [ "$changed" -eq 1 ]; then
+    check_config || return 1
+    gateway_apply || return 1
+    green "共享证书已同步，Nginx 已平滑重载；未重启网站应用或 sing-box"
+  fi
+}
+
+shared_gateway_menu(){
+  local choice domain state="$CONFIG_DIR/.shared-443"
+  while true; do
+    echo "======================================"
+    echo " 共享 443 / 网站管理"
+    echo "1. 接入 / 修改网站（本机 HTTP 服务）"
+    echo "2. 查看共享域名与内部端口"
+    echo "3. 删除网站接入"
+    echo "4. 同步续期证书 / 修复续期任务"
+    echo "0. 返回"
+    read -rp "请选择: " choice
+    case "$choice" in
+      1) prepare_runtime && run_locked shared_transaction shared_add_website; pause ;;
+      2) if [ -f "$state" ]; then jq '.domains | to_entries | map({domain:.key,type:.value.kind,public_port:443,internal_port:.value.backend_port,website:.value.website_upstream})' "$state"; else yellow "尚未启用共享入口"; fi; pause ;;
+      3)
+        read -rp "要移除网站接入的域名: " domain
+        if [ -f "$state" ]; then run_locked shared_transaction shared_remove_website "$domain"; fi; pause ;;
+      4) if [ -f "$state" ]; then run_locked shared_transaction sync_shared_certificates && install_gateway_renewal; fi; pause ;;
+      0) break ;;
+      *) red "无效选择" ;;
+    esac
+  done
+}
+
+shared_remove_website(){
+  local domain="$1" state="$CONFIG_DIR/.shared-443" tmp
+  valid_domain "$domain" && [ -f "$state" ] || return 1
+  tmp=$(mktemp "$CONFIG_DIR/.gateway-state.XXXXXX") || return 1
+  jq --arg d "$domain" 'if .domains[$d].kind == "website" then del(.domains[$d]) else del(.domains[$d].website_upstream) end' "$state" > "$tmp" || return 1
+  mv "$tmp" "$state" || return 1
+  gateway_apply
+}
+
 install_certbot(){
   if command -v certbot >/dev/null 2>&1; then
     return
@@ -357,26 +823,30 @@ issue_letsencrypt_cert(){
   local tag="$3"
   local cert_dir="$4"
   local renew_hook="/etc/letsencrypt/renewal-hooks/deploy/singbox-docker-$tag.sh"
+  valid_domain "$domain" && valid_node_tag "$tag" || { red "域名或标签格式无效"; return 1; }
 
   install_certbot
 
   yellow "即将通过 Let's Encrypt HTTP-01 申请证书，请确保："
   yellow "1. 域名 $domain 已解析到本服务器"
-  yellow "2. 服务器 80/tcp 已放行且未被其他服务占用"
+  yellow "2. 服务器 80/tcp 已放行；已有共享入口时自动使用其验证目录"
   yellow "3. 云服务器安全组已放行 80/tcp"
 
-  if port_used 80 tcp; then
+  local args=(certonly --non-interactive --agree-tos --preferred-challenges http --cert-name "$domain" -d "$domain")
+  if gateway_running; then
+    args+=(--webroot -w "$CONFIG_DIR/gateway/acme")
+  elif port_used 80 tcp; then
     red "80 端口已被占用，certbot standalone 无法申请证书"
     return 1
-  fi
-
-  if [ -n "$email" ]; then
-    certbot certonly --standalone --non-interactive --agree-tos \
-      --preferred-challenges http -m "$email" -d "$domain"
   else
-    certbot certonly --standalone --non-interactive --agree-tos \
-      --register-unsafely-without-email --preferred-challenges http -d "$domain"
+    args+=(--standalone)
   fi
+  if [ -n "$email" ]; then
+    args+=(-m "$email")
+  else
+    args+=(--register-unsafely-without-email)
+  fi
+  certbot "${args[@]}" || return 1
 
   mkdir -p "$cert_dir"
   cp "/etc/letsencrypt/live/$domain/fullchain.pem" "$cert_dir/cert.pem"
@@ -531,6 +1001,7 @@ start_service(){
     id=$(service_container) || return 1
   fi
   [ -n "$id" ] && wait_service "$id" || return 1
+  if [ -f "$CONFIG_DIR/.shared-443" ] && ! gateway_running; then gateway_apply || return 1; fi
   green "sing-box 已启动"
 }
 
@@ -565,6 +1036,12 @@ read_port(){
 
 add_reality(){
   prepare_runtime || return
+  local shared_domain
+  read -rp "共享 443 域名 [留空使用独立端口]: " shared_domain
+  if [ -n "$shared_domain" ]; then
+    shared_transaction shared_add_node vless "$shared_domain"
+    return $?
+  fi
   ensure_singbox_image || return
 
   local port tag sni uuid short_id server_ip key_output private_key public_key inbound
@@ -649,6 +1126,12 @@ EOFINFO
 
 add_hysteria2(){
   prepare_runtime || return
+  local shared_domain
+  read -rp "共享 443 域名 [留空使用独立端口]: " shared_domain
+  if [ -n "$shared_domain" ]; then
+    shared_transaction shared_add_node hysteria2 "$shared_domain"
+    return $?
+  fi
 
   local port tag password sni cert_dir server_ip inbound cert_pin_hex password_uri tag_uri cert_mode cert_note link_host email
   port=$(read_port "监听端口 [默认 8443]: " 8443) || return
@@ -762,6 +1245,12 @@ EOFINFO
 
 add_anytls(){
   prepare_runtime || return
+  local shared_domain
+  read -rp "共享 443 域名 [留空使用独立端口]: " shared_domain
+  if [ -n "$shared_domain" ]; then
+    shared_transaction shared_add_node anytls "$shared_domain"
+    return $?
+  fi
 
   local port tag password sni cert_dir server_ip inbound cert_pin_hex password_uri tag_uri cert_mode cert_note link_host email
   port=$(read_port "监听端口 [默认 8444]: " 8444) || return
@@ -959,6 +1448,10 @@ delete_inbound(){
   fi
 
   backup_config || return 1
+  if shared_domain_for_tag "$tag" >/dev/null; then
+    shared_transaction shared_delete_node "$tag"
+    return $?
+  fi
   local tmp
   tmp=$(mktemp "$CONFIG_DIR/.candidate.XXXXXX")
   if ! jq --arg tag "$tag" '.inbounds = [.inbounds[] | select(.tag != $tag)]' "$CONFIG_FILE" > "$tmp"; then
@@ -968,6 +1461,22 @@ delete_inbound(){
   apply_config "$tmp" || return 1
   remove_info_by_tag "$tag"
   green "入站 $tag 已删除"
+}
+
+shared_delete_node(){
+  local tag="$1" state="$CONFIG_DIR/.shared-443" tmp
+  tmp=$(mktemp "$CONFIG_DIR/.candidate.XXXXXX") || return 1
+  jq --arg tag "$tag" '.inbounds |= map(select(.tag != $tag))' "$CONFIG_FILE" > "$tmp" || return 1
+  apply_config "$tmp" || return 1
+  tmp=$(mktemp "$CONFIG_DIR/.gateway-state.XXXXXX") || return 1
+  jq --arg tag "$tag" '.domains |= with_entries(
+    if .value.tag == $tag then
+      if .value.website_upstream then .value |= (del(.tag,.backend_port) | .kind = "website") else empty end
+    else . end)' "$state" > "$tmp" || return 1
+  mv "$tmp" "$state" || return 1
+  gateway_apply || return 1
+  remove_info_by_tag "$tag"
+  green "入站及共享分流规则已删除；同域名的网站接入会保留"
 }
 
 show_info(){
@@ -985,10 +1494,12 @@ show_info(){
 
   server_ip=$(public_ip)
   jq -c '.inbounds[]?' "$CONFIG_FILE" | while IFS= read -r inbound; do
-    local type tag port block
+    local type tag port block address shared_domain
     type=$(printf '%s' "$inbound" | jq -r '.type')
     tag=$(printf '%s' "$inbound" | jq -r '.tag')
     port=$(printf '%s' "$inbound" | jq -r '.listen_port')
+    address="$server_ip"
+    if shared_domain=$(shared_domain_for_tag "$tag"); then address="$shared_domain"; port=443; fi
 
     case "$type" in
       vless)
@@ -1000,7 +1511,7 @@ show_info(){
           echo "=============================="
           echo "类型：VLESS Reality"
           echo "标签：$tag"
-          echo "地址：$server_ip"
+          echo "地址：$address"
           echo "端口：$port"
           echo "UUID：$(printf '%s' "$inbound" | jq -r '.users[0].uuid // empty')"
           echo "Flow：$(printf '%s' "$inbound" | jq -r '.users[0].flow // empty')"
@@ -1018,7 +1529,7 @@ show_info(){
           echo "=============================="
           echo "类型：$type"
           echo "标签：$tag"
-          echo "地址：$server_ip"
+          echo "地址：$address"
           echo "端口：$port"
           echo "密码：$(printf '%s' "$inbound" | jq -r '.users[0].password // empty')"
           echo "SNI：$(printf '%s' "$inbound" | jq -r '.tls.server_name // empty')"
@@ -1055,7 +1566,14 @@ show_config(){
 
 show_inbounds(){
   if [ -f "$CONFIG_FILE" ]; then
-    jq '.inbounds[]? | {tag,type,listen_port,network,override_address,override_port}' "$CONFIG_FILE"
+    if [ -f "$CONFIG_DIR/.shared-443" ]; then
+      jq --slurpfile gateway "$CONFIG_DIR/.shared-443" '.inbounds[]? | . as $i |
+        ([$gateway[0].domains | to_entries[] | select(.value.tag == $i.tag) | .key][0]) as $domain |
+        {tag,type,listen,listen_port,network,override_address,override_port} +
+        (if $domain then {shared_domain:$domain,public_port:443} else {} end)' "$CONFIG_FILE"
+    else
+      jq '.inbounds[]? | {tag,type,listen,listen_port,network,override_address,override_port}' "$CONFIG_FILE"
+    fi
   else
     red "未找到配置文件"
   fi
@@ -1079,6 +1597,7 @@ show_hysteria2_links(){
     local tag port password sni cert_path host_cert_path cert_pin_hex password_uri tag_uri
     tag=$(printf '%s' "$inbound" | jq -r '.tag')
     port=$(printf '%s' "$inbound" | jq -r '.listen_port')
+    if shared_domain_for_tag "$tag" >/dev/null; then port=443; fi
     password=$(printf '%s' "$inbound" | jq -r '.users[0].password')
     sni=$(printf '%s' "$inbound" | jq -r '.tls.server_name // empty')
     cert_path=$(printf '%s' "$inbound" | jq -r '.tls.certificate_path // empty')
@@ -1149,6 +1668,7 @@ show_anytls_links(){
     local tag port password sni cert_path host_cert_path cert_pin_hex password_uri tag_uri link_host
     tag=$(printf '%s' "$inbound" | jq -r '.tag')
     port=$(printf '%s' "$inbound" | jq -r '.listen_port')
+    if shared_domain_for_tag "$tag" >/dev/null; then port=443; fi
     password=$(printf '%s' "$inbound" | jq -r '.users[0].password')
     sni=$(printf '%s' "$inbound" | jq -r '.tls.server_name // empty')
     cert_path=$(printf '%s' "$inbound" | jq -r '.tls.certificate_path // empty')
@@ -1219,6 +1739,7 @@ add_config_menu(){
     echo "2. 添加 Hysteria2 入站"
     echo "3. 添加 AnyTLS 入站"
     echo "4. 添加 Door 转发入站"
+    echo "5. 共享 443 / 网站管理"
     echo "0. 返回主菜单"
     echo "======================================"
     read -rp "请选择: " a
@@ -1228,6 +1749,7 @@ add_config_menu(){
       2) run_locked add_hysteria2; pause ;;
       3) run_locked add_anytls; pause ;;
       4) run_locked add_door; pause ;;
+      5) shared_gateway_menu ;;
       0) break ;;
       *) red "无效选择"; pause ;;
     esac
@@ -1326,6 +1848,9 @@ deployment_cleanup(){
     fi
     if [ "$deploy_started" -eq 1 ] && [ "$recovered" -eq 1 ]; then
       recover_service "$old_id" "$old_image" || recovered=0
+      if [ -f "$CONFIG_DIR/.shared-443" ] || [ -f "$transaction/failed-config/.shared-443" ]; then
+        restore_gateway_service || recovered=0
+      fi
     fi
     [ "$result" -ne 0 ] || result=1
     if [ "$recovered" -ne 1 ]; then
@@ -1392,6 +1917,9 @@ restore_config() (
     fi
     deploy_started=1
     recreate_service || return 1
+    if [ -f "$CONFIG_DIR/.shared-443" ] || [ -f "$transaction/original-config/.shared-443" ]; then
+      restore_gateway_service || return 1
+    fi
     committed=1
     green "配置已恢复并重启"
   else
@@ -1632,12 +2160,22 @@ update_menu(){
 
 uninstall(){
   echo "即将停止容器并删除目录：$WORK_DIR"
+  if [ -f "$CONFIG_DIR/.shared-443" ]; then yellow "同时关闭脚本管理的 HTTPS 入口；不会删除网站应用的容器或数据。"; fi
   read -rp "确认卸载？输入 y 确认: " c
   if [ "$c" = "y" ]; then
     backup_config || true
-    cd "$WORK_DIR" 2>/dev/null && docker compose down || true
+    if [ -f "$COMPOSE_FILE" ]; then compose rm --stop --force sing-box || return 1; fi
+    local gateway_id
+    gateway_id=$(gateway_container) || return 1
+    [ -z "$gateway_id" ] || docker rm -f "$gateway_id" || return 1
     rm -rf "$WORK_DIR"
     rm -f "$SCRIPT_PATH"
+    if [ -f /etc/systemd/system/singbox-shared-certificates.timer ]; then
+      systemctl disable --now singbox-shared-certificates.timer || true
+      rm -f /etc/systemd/system/singbox-shared-certificates.timer /etc/systemd/system/singbox-shared-certificates.service
+      systemctl daemon-reload || true
+    fi
+    rm -f /etc/letsencrypt/renewal-hooks/deploy/singbox-shared-443.sh
     green "已卸载，并删除快捷命令 sb"
   else
     yellow "已取消"
@@ -1688,6 +2226,12 @@ menu(){
 main(){
   check_root
   need_cmd bash
+  if [ "${1:-}" = --sync-shared-certificates ]; then
+    [ -f "$CONFIG_DIR/.shared-443" ] || return 0
+    run_locked shared_transaction sync_shared_certificates
+    return $?
+  fi
+  [ "$#" -eq 0 ] || { red "未知参数"; return 1; }
   while true; do
     menu
   done

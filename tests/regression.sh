@@ -246,10 +246,76 @@ stop_replacement_before_recovery() (
   [ "$(tail -n 1 "$TRACE")" = 'restart old-id' ]
 )
 
+shared_operation_rollback() (
+  fixture
+  mkdir -p "$CONFIG_DIR/gateway"
+  echo original-nginx > "$CONFIG_DIR/gateway/nginx.conf"
+  echo '{"version":1,"domains":{}}' > "$CONFIG_DIR/.shared-443"
+  service_container(){ echo core-id; }; gateway_container(){ echo gateway-id; }; gateway_running(){ return 0; }
+  docker(){
+    case "$1" in
+      inspect) if [[ "$*" = *Image* ]]; then echo sha256:old; else echo true; fi ;;
+      exec) echo nginx-reload >> "$TRACE" ;;
+      *) echo unexpected >> "$TRACE"; return 1 ;;
+    esac
+  }
+  recover_service(){ cmp "$CONFIG_FILE" "$WORK_DIR/original.json"; echo core-recovered >> "$TRACE"; }
+  break_shared_operation(){
+    echo '{"inbounds":[{"tag":"bad"}]}' > "$CONFIG_FILE"
+    echo changed > "$INFO_FILE"
+    echo changed > "$COMPOSE_FILE"
+    echo changed > "$CONFIG_DIR/gateway/nginx.conf"
+    return 1
+  }
+  if shared_transaction break_shared_operation; then exit 1; fi
+  cmp "$CONFIG_FILE" "$WORK_DIR/original.json"
+  cmp "$COMPOSE_FILE" "$WORK_DIR/original-compose"
+  [ "$(cat "$INFO_FILE")" = original-info ]
+  [ "$(cat "$CONFIG_DIR/gateway/nginx.conf")" = original-nginx ]
+  grep -q core-recovered "$TRACE"
+  grep -q nginx-reload "$TRACE"
+  ! grep -q unexpected "$TRACE"
+)
+
+shared_preflight_failure_is_non_disruptive() (
+  fixture
+  service_container(){ echo core-id; }; gateway_container(){ echo gateway-id; }; gateway_running(){ return 0; }
+  docker(){
+    if [ "$1" = inspect ]; then
+      if [[ "$*" = *Image* ]]; then echo sha256:old; else echo true; fi
+    else echo unexpected > "$TRACE"; return 1; fi
+  }
+  recover_service(){ echo unexpected > "$TRACE"; return 1; }
+  if shared_transaction false; then exit 1; fi
+  [ ! -f "$TRACE" ]
+  cmp "$CONFIG_FILE" "$WORK_DIR/original.json"
+)
+
+shared_refuses_unmanaged_ports() (
+  fixture
+  compose(){ echo '{"services":{"sing-box":{}}}'; }
+  gateway_running(){ return 1; }
+  port_used(){ [ "$1" = 443 ]; }
+  if gateway_preflight; then exit 1; fi
+  [ ! -f "$CONFIG_DIR/.shared-443" ]
+)
+
+shared_delete_preserves_website() (
+  fixture
+  printf '%s\n' '{"inbounds":[{"tag":"node"},{"tag":"other"}]}' > "$CONFIG_FILE"
+  printf '%s\n' '{"domains":{"node.test":{"kind":"vless","tag":"node","backend_port":22000,"website_upstream":"http://127.0.0.1:8080"},"other.test":{"kind":"anytls","tag":"other"}}}' > "$CONFIG_DIR/.shared-443"
+  apply_config(){ mv "$1" "$CONFIG_FILE"; }
+  gateway_apply(){ :; }; remove_info_by_tag(){ :; }
+  shared_delete_node node
+  jq -e '.inbounds | length == 1' "$CONFIG_FILE" >/dev/null
+  jq -e '.domains["node.test"].kind == "website" and .domains["node.test"].tag == null and .domains["other.test"].tag == "other"' "$CONFIG_DIR/.shared-443" >/dev/null
+)
+
 for test in reject_candidate commit_candidate rollback_candidate rollback_on_disconnect \
   backup_failure backup_without_info regular_restart_keeps_container validate_running_image \
   protocol_specific_ports find_renamed_container recover_deleted_container restore_failure readiness_rejects_crash \
-  backup_integrity_failure update_requires_backup failed_recovery_retains_evidence stop_replacement_before_recovery; do
+  backup_integrity_failure update_requires_backup failed_recovery_retains_evidence stop_replacement_before_recovery \
+  shared_operation_rollback shared_preflight_failure_is_non_disruptive shared_refuses_unmanaged_ports shared_delete_preserves_website; do
   run_test "$test"
 done
 for phase in pull validate replace; do run_test update_failure "$phase"; done

@@ -1,0 +1,9 @@
+FROM ghcr.io/sagernet/sing-box:latest AS core
+FROM nginx:stable-alpine
+RUN apk add --no-cache bash jq openssl curl iproute2 util-linux coreutils shellcheck
+COPY --from=core /usr/local/bin/sing-box /usr/local/bin/sing-box
+WORKDIR /workspace
+COPY singbox-docker.sh ./singbox-docker.sh
+COPY tests ./tests
+ENTRYPOINT ["bash"]
+CMD ["tests/shared443.sh"]

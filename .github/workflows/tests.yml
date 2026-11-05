@@ -15,12 +15,19 @@ jobs:
         run: |
           bash -n singbox-docker.sh
           bash -n install.sh
+          bash -n tests/shared443.sh
           bash tests/regression.sh
-          shellcheck -S error singbox-docker.sh tests/regression.sh tests/docker-lifecycle.sh
+          shellcheck -S error singbox-docker.sh tests/regression.sh tests/docker-lifecycle.sh tests/shared443.sh tests/gateway-lifecycle.sh
+      - name: Test real shared HTTPS, Reality, AnyTLS and Hysteria2
+        run: |
+          docker build -f tests/Dockerfile.shared -t local/sb-shared-tests .
+          docker run --rm local/sb-shared-tests
       - name: Test real container recovery
         run: |
           docker pull alpine:3.22
           bash tests/docker-lifecycle.sh
+      - name: Test gateway creation, rollback and website preservation
+        run: bash tests/gateway-lifecycle.sh
       - name: Build QUIC-enabled image
         run: |
           docker build -t local/sing-box:review .

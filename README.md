@@ -19,6 +19,9 @@ Docker 版 sing-box 多入站管理脚本。核心运行使用 SagerNet 官方 s
 - 配置先校验再应用，应用失败时恢复原配置并尝试恢复旧服务
 - 普通重启保留容器；镜像升级单独执行，失败时按旧镜像 ID 恢复
 - 已校验的原子备份、管理操作互斥锁、按 TCP/UDP 分别检查端口
+- 添加 VLESS Reality / Hysteria2 / AnyTLS 时可选域名，自动接入共享 443
+- 独立 Docker Nginx 按 SNI 转发 TCP 节点，并反向代理本机网站
+- 共享入口使用 webroot 申请证书、导入已有证书、自动同步续期和平滑重载
 
 ## 快速使用
 
@@ -70,7 +73,7 @@ sudo SCRIPT_URL=https://raw.githubusercontent.com/MISThelio/singbox-docker/main/
 ## 升级已有安装
 
 运行 `sb`，选择 `更新管理 -> 更新脚本自身`，然后退出菜单并重新执行 `sb`。
-本次修复版本在主菜单显示 `脚本版本：2026.11.05.1`。更新脚本本身不会更新镜像或重启节点。
+当前共享入口版本在主菜单显示 `脚本版本：2026.11.06.1`。更新脚本本身不会更新镜像、启用共享入口或重启节点。
 
 `启动/重启 sing-box` 使用已有容器及其实际镜像。需要升级核心或切换镜像时，使用
 `更新管理 -> 更新 sing-box 镜像`；该操作才会拉取镜像并替换容器。
@@ -129,6 +132,8 @@ bash -n install.sh
 bash tests/regression.sh
 shellcheck -S error singbox-docker.sh tests/regression.sh
 bash tests/docker-lifecycle.sh
+docker build -f tests/Dockerfile.shared -t local/sb-shared-tests .
+docker run --rm local/sb-shared-tests
 docker build -t local/sing-box:review .
 docker run --rm local/sing-box:review version
 ```
@@ -144,6 +149,68 @@ docker run --rm local/sing-box:review version
 - Let's Encrypt 真实证书：推荐，需要域名已解析到服务器，并放行 `80/tcp` 用于 HTTP-01 验证。
 
 真实证书模式会把证书复制到 `/opt/sing-box/config/cert-标签/`，并安装 certbot 续期 hook，续期后自动重启 sing-box 容器。
+
+## 可选域名与共享 443
+
+添加 VLESS Reality、Hysteria2 或 AnyTLS 时，首先会询问：
+
+```text
+共享 443 域名 [留空使用独立端口]:
+```
+
+- 留空：保持原来的独立端口模式，不安装或启用共享入口。
+- 填写域名：自动准备官方 `nginx:stable-alpine` 容器、内部端口、证书和分流规则；节点对外端口固定为 443。
+- 域名必须事先直接解析到此服务器，A / AAAA 记录均应正确；普通 CDN 的 HTTP 代理不适用于这些原始节点协议。
+- 自动申请证书需要公网能够访问 `80/TCP`。脚本可尝试放行 UFW，但不能自动修改云厂商安全组。
+
+建议使用不同子域名，例如：
+
+| 域名 | 公网入口 | 处理方式 |
+| --- | --- | --- |
+| `www.example.com` | TCP 443 | Nginx HTTPS 网站反向代理 |
+| `reality.example.com` | TCP 443 | Nginx SNI 透传到本机 VLESS Reality |
+| `anytls.example.com` | TCP 443 | Nginx SNI 透传到本机 AnyTLS |
+| `hy2.example.com` | UDP 443 | 直接进入 sing-box Hysteria2，不经过 Nginx TCP 分流 |
+
+内部 TCP 入站和 HTTPS 握手目标只监听 `127.0.0.1`，内部端口无需在安全组放行。
+共享 Reality 的 SNI 使用填写的域名，握手目标是本机 Nginx 对应的真实证书 HTTPS 服务。
+脚本生成的节点链接始终使用域名和公网 443，而不是内部端口。
+
+### 接入正常网站
+
+先让网站应用在宿主机本地 HTTP 端口提供服务，例如 Docker 应用发布为
+`127.0.0.1:8080:80`；保留应用本身的持久化数据和运行方式。然后进入：
+
+```text
+添加配置 -> 共享 443 / 网站管理 -> 接入 / 修改网站
+网站域名：www.example.com
+网站本机 HTTP 地址：http://127.0.0.1:8080
+```
+
+网站应用、sing-box 和 Nginx 是独立服务；添加网站不会重建应用容器。
+停止 sing-box 节点不会停止 Nginx 网站入口。修改分流或更新共享证书使用 Nginx reload，
+不会重启网站应用。Nginx 流日志可通过以下命令查看：
+
+```bash
+cd /opt/sing-box
+docker compose logs --tail 100 singbox-gateway
+```
+
+Nginx 透传未启用 PROXY protocol，因此 sing-box 的共享 TCP 入站看到的来源是本机，
+原始客户端 IP 在 Nginx 流日志中。请不要把本机测试通过当作公网链路已验证。
+
+### 证书与边界
+
+- 自动申请时先启动 HTTP-01 验证入口，再使用 Certbot webroot；后续续期不需要停止 Nginx，也不使用独占 80 的 standalone。
+- 可以导入宿主机上的完整证书链和未加密私钥。脚本检查域名、有效期和密钥匹配，但导入证书的公共 CA 信任仍由证书提供方保证。
+- Certbot deploy hook 和 systemd 五分钟同步任务会同步证书。导入证书的原管理工具仍负责申请、续期；同步任务不会替它申请证书。
+- 没有运行 systemd 的系统需将 `sb --sync-shared-certificates` 接入原工具的续期后任务，并确保已有 `certbot renew` 定时任务。
+- 若 80/TCP、443/TCP 已被非本脚本管理的网站或节点占用，脚本会拒绝自动接管。先规划将原网站入口迁移到本机其他 HTTP 端口，再接入；不要直接覆盖原 Nginx 配置。
+- 若已有证书依赖 standalone 独占 80 续期，也会拒绝首次启用，以免旧证书日后无法续期；应先改为 DNS 或持续可用的 webroot 验证。独立端口模式仍然可用。
+- 一个 IP 的 UDP 443 只能有一个独立 Hy2 监听。第二个共享 Hy2 入站会被拒绝；普通 Nginx SNI 模块不分流 QUIC，也不能与网站 HTTP/3 同时独占 UDP 443。
+- TCP 分流依赖可见的 TLS SNI。VLESS / AnyTLS 节点和网站使用不同子域名，保证网站不依赖节点运行；普通非 TLS Door 转发不支持这种域名共享方式。不要为生成的共享 TCP 节点额外开启隐藏真实 SNI 的 ECH。
+- 共享路由、Nginx 配置和证书保存在 `config` 内，包含在已有备份中。删除共享节点同步删除其路由，若同域名还配置了网站，会保留网站。
+- 本功能不修改 Docker daemon、数据根目录或全局网络路由，也不能保证修复公网路径上的间歇性断连。
 
 ## AnyTLS
 
