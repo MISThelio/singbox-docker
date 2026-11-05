@@ -1,0 +1,27 @@
+name: Script regression tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq iproute2 util-linux shellcheck
+      - name: Syntax, failure recovery and static checks
+        run: |
+          bash -n singbox-docker.sh
+          bash -n install.sh
+          bash tests/regression.sh
+          shellcheck -S error singbox-docker.sh tests/regression.sh tests/docker-lifecycle.sh
+      - name: Test real container recovery
+        run: |
+          docker pull alpine:3.22
+          bash tests/docker-lifecycle.sh
+      - name: Build QUIC-enabled image
+        run: |
+          docker build -t local/sing-box:review .
+          docker run --rm local/sing-box:review version | grep with_quic

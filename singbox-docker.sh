@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+umask 077
+SCRIPT_VERSION="2026.11.05.1"
 
 SING_BOX_VERSION="${SING_BOX_VERSION:-latest}"
 SING_BOX_IMAGE="${SING_BOX_IMAGE:-ghcr.io/sagernet/sing-box:${SING_BOX_VERSION}}"
@@ -45,7 +47,7 @@ install_shortcut(){
 install_packages(){
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update
-    apt-get install -y curl wget openssl jq uuid-runtime ca-certificates iproute2
+    apt-get install -y curl wget openssl jq uuid-runtime util-linux ca-certificates iproute2
   elif command -v dnf >/dev/null 2>&1; then
     dnf install -y curl wget openssl jq util-linux ca-certificates iproute
   elif command -v yum >/dev/null 2>&1; then
@@ -118,22 +120,99 @@ YAML
 }
 
 sync_compose_image(){
-  if [ ! -f "$COMPOSE_FILE" ]; then
-    write_compose_file
-    return
-  fi
-
   local tmp
-  tmp=$(mktemp)
-
-  if grep -qE '^[[:space:]]*image:[[:space:]]+ghcr\.io/sagernet/sing-box:' "$COMPOSE_FILE"; then
-    sed -E "s#^([[:space:]]*image:[[:space:]]+)ghcr\.io/sagernet/sing-box:[^[:space:]]+#\1${SING_BOX_IMAGE}#" "$COMPOSE_FILE" > "$tmp"
-    mv "$tmp" "$COMPOSE_FILE"
-    green "docker-compose.yml 镜像已同步为：$SING_BOX_IMAGE"
-  else
+  tmp=$(mktemp "$WORK_DIR/.compose.XXXXXX")
+  if ! compose config --no-interpolate --no-env-resolution --no-path-resolution --format json \
+    | jq --arg image "${1:-$SING_BOX_IMAGE}" '.services["sing-box"].image = $image' > "$tmp"; then
     rm -f "$tmp"
-    yellow "未在 docker-compose.yml 中找到官方 sing-box 镜像行，跳过自动修改"
+    return 1
   fi
+  if ! docker compose --project-directory "$WORK_DIR" -f "$tmp" config -q; then
+    rm -f "$tmp"
+    return 1
+  fi
+  chmod 600 "$tmp"
+  mv "$tmp" "$COMPOSE_FILE"
+}
+
+compose(){
+  docker compose --project-directory "$WORK_DIR" -f "$COMPOSE_FILE" "$@"
+}
+
+compose_image(){
+  docker compose --project-directory "$WORK_DIR" -f "${1:-$COMPOSE_FILE}" config --format json \
+    | jq -er '.services["sing-box"].image | select(type == "string" and length > 0)'
+}
+
+runtime_image(){
+  local id
+  id=$(service_container) || return 1
+  if [ -n "$id" ]; then
+    docker inspect --format '{{.Image}}' "$id"
+  else
+    compose_image
+  fi
+}
+
+service_container(){
+  local ids
+  ids=$(compose ps -a -q sing-box) || return 1
+  [ -n "$ids" ] || return 0
+  docker inspect $ids | jq -r '
+    map(select(.State.Status != "created"))
+    | sort_by(.State.Running, .State.StartedAt) | last | .Id // empty'
+}
+
+wait_service(){
+  local id="$1" state stable=0 attempt
+  for ((attempt=0; attempt<20; attempt++)); do
+    state=$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id") || return 1
+    case "$state" in
+      'running healthy'|'running none')
+        stable=$((stable + 1))
+        [ "$stable" -ge 3 ] && return 0
+        ;;
+      'running starting'|'restarting '*) stable=0 ;;
+      *) red "sing-box 未正常运行：$state"; return 1 ;;
+    esac
+    sleep 1
+  done
+  red "等待 sing-box 启动超时"
+  return 1
+}
+
+recover_service(){
+  local old_id="$1" old_image="$2" id replacements
+  [ -n "$old_image" ] || { red "没有可恢复的旧容器镜像"; return 1; }
+  replacements=$(compose ps -a -q sing-box) || return 1
+  for id in $replacements; do
+    if [ "$id" != "$old_id" ]; then
+      docker stop "$id" || return 1
+    fi
+  done
+  sync_compose_image "$old_image" || return 1
+  if [ -n "$old_id" ] && docker container inspect "$old_id" >/dev/null 2>&1; then
+    docker restart "$old_id" || return 1
+    wait_service "$old_id" || return 1
+  else
+    # A pulled tag can point at a new image; recovery must use the old image ID.
+    compose up -d --no-deps --force-recreate sing-box || return 1
+    id=$(service_container) || return 1
+    [ -n "$id" ] && wait_service "$id" || return 1
+  fi
+  yellow "旧服务已恢复；本次变更未成功"
+}
+
+run_locked(){
+  need_cmd flock
+  mkdir -p "$WORK_DIR"
+  (
+    if ! flock -n 9; then
+      red "另一个管理操作正在执行，请完成后重试"
+      return 1
+    fi
+    "$@"
+  ) 9>"$WORK_DIR/.operation.lock"
 }
 
 install_base(){
@@ -174,25 +253,28 @@ prepare_runtime(){
 }
 
 ensure_singbox_image(){
-  if docker image inspect "$SING_BOX_IMAGE" >/dev/null 2>&1; then
+  local image
+  image="${1:-$(runtime_image)}" || return 1
+  [ -n "$image" ] || return 1
+  if docker image inspect "$image" >/dev/null 2>&1; then
     return 0
   fi
 
-  yellow "本地没有 sing-box 镜像，正在拉取：$SING_BOX_IMAGE"
+  yellow "本地没有 sing-box 镜像，正在拉取：$image"
   local pull_log
   pull_log=$(mktemp)
 
-  if docker pull "$SING_BOX_IMAGE" 2>&1 | tee "$pull_log"; then
+  if docker pull "$image" 2>&1 | tee "$pull_log"; then
     rm -f "$pull_log"
     return 0
   fi
 
-  if grep -qi 'denied' "$pull_log" && printf '%s' "$SING_BOX_IMAGE" | grep -q '^ghcr\.io/'; then
+  if grep -qi 'denied' "$pull_log" && printf '%s' "$image" | grep -q '^ghcr\.io/'; then
     red "GHCR 返回 denied。常见原因是 Docker 保存了失效的 ghcr.io 登录凭据，或当前网络无法匿名拉取 GHCR。"
     read -rp "是否执行 docker logout ghcr.io 后重试？输入 y: " retry_ghcr
     if [ "$retry_ghcr" = "y" ]; then
       docker logout ghcr.io || true
-      if docker pull "$SING_BOX_IMAGE"; then
+      if docker pull "$image"; then
         rm -f "$pull_log"
         return 0
       fi
@@ -201,8 +283,8 @@ ensure_singbox_image(){
 
   rm -f "$pull_log"
   red "sing-box 镜像不可用，已停止操作；配置文件不会继续写入。"
-  yellow "可尝试手动执行：docker logout ghcr.io && docker pull $SING_BOX_IMAGE"
-  yellow "如果仍失败，可临时指定可用镜像运行脚本：SING_BOX_IMAGE=你的镜像 sb"
+  yellow "可尝试手动执行：docker logout ghcr.io && docker pull $image"
+  yellow "如果仍失败，可设置 SING_BOX_IMAGE=可用镜像 sb，再进入更新管理 -> 更新 sing-box 镜像"
   return 1
 }
 
@@ -211,8 +293,20 @@ public_ip(){
 }
 
 port_used(){
-  local port="$1"
-  ss -lntup 2>/dev/null | grep -qE "[:.]${port}[[:space:]]"
+  local port="$1" proto="$2" sockets
+  case "$proto" in
+    tcp) sockets=$(ss -H -lnt "sport = :$port") || return 2 ;;
+    udp) sockets=$(ss -H -lnu "sport = :$port") || return 2 ;;
+    *) return 2 ;;
+  esac
+  [ -z "$sockets" ] || return 0
+  [ -f "$CONFIG_FILE" ] || return 1
+  jq -e --argjson port "$port" --arg proto "$proto" '
+    .inbounds[]? | select(.listen_port == $port) |
+    (if (.type == "hysteria2" or .type == "hysteria" or .type == "tuic") then "udp"
+     elif (.type == "vless" or .type == "anytls" or .type == "trojan") then "tcp"
+     else (.network // "tcp,udp") end) |
+    split(",") | index($proto) != null' "$CONFIG_FILE" >/dev/null
 }
 
 tag_exists(){
@@ -271,7 +365,7 @@ issue_letsencrypt_cert(){
   yellow "2. 服务器 80/tcp 已放行且未被其他服务占用"
   yellow "3. 云服务器安全组已放行 80/tcp"
 
-  if port_used 80; then
+  if port_used 80 tcp; then
     red "80 端口已被占用，certbot standalone 无法申请证书"
     return 1
   fi
@@ -298,7 +392,7 @@ if [ "\$RENEWED_LINEAGE" = "/etc/letsencrypt/live/$domain" ]; then
   cp "\$RENEWED_LINEAGE/privkey.pem" "$cert_dir/private.key"
   chmod 600 "$cert_dir/private.key"
   cd "$WORK_DIR"
-  docker compose up -d --force-recreate
+  docker compose --project-directory "$WORK_DIR" -f "$COMPOSE_FILE" restart sing-box
 fi
 EOFHOOK
   chmod +x "$renew_hook"
@@ -307,9 +401,12 @@ EOFHOOK
 add_inbound(){
   local inbound_json="$1"
   local tmp
-  tmp=$(mktemp)
-  jq --argjson inbound "$inbound_json" '.inbounds += [$inbound]' "$CONFIG_FILE" > "$tmp"
-  mv "$tmp" "$CONFIG_FILE"
+  tmp=$(mktemp "$CONFIG_DIR/.candidate.XXXXXX")
+  if ! jq --argjson inbound "$inbound_json" '.inbounds += [$inbound]' "$CONFIG_FILE" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  apply_config "$tmp"
 }
 
 latest_info_block_by_tag(){
@@ -357,29 +454,88 @@ remove_info_by_tag(){
 }
 
 check_config(){
-  mkdir -p "$CONFIG_DIR"
-  ensure_singbox_image || return
+  local file="${1:-$CONFIG_FILE}" directory="${2:-$CONFIG_DIR}" image
+  image="${3:-$(runtime_image)}" || return 1
+  [ -n "$image" ] || return 1
+  ensure_singbox_image "$image" || return 1
   docker run --rm \
-    -v "$CONFIG_DIR:/etc/sing-box" \
-    "$SING_BOX_IMAGE" \
-    check -C /etc/sing-box
+    -v "$directory:/etc/sing-box:ro" \
+    -v "$file:/etc/sing-box/config.json:ro" \
+    "$image" check -C /etc/sing-box
+}
+
+apply_config() (
+  local candidate="$1" previous old_id old_image="" changed=0 started=0 committed=0
+  if ! check_config "$candidate"; then
+    rm -f "$candidate"
+    red "候选配置检查失败，当前配置未变更"
+    return 1
+  fi
+  previous=$(mktemp "$CONFIG_DIR/.previous.XXXXXX")
+  cp -p "$CONFIG_FILE" "$previous" || return 1
+  trap config_cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  old_id=$(service_container) || return 1
+  if [ -n "$old_id" ]; then
+    old_image=$(docker inspect --format '{{.Image}}' "$old_id") || return 1
+  fi
+  chmod 600 "$candidate"
+  changed=1
+  mv "$candidate" "$CONFIG_FILE" || return 1
+  started=1
+  restart_service || return 1
+  committed=1
+)
+
+config_cleanup(){
+  local result=$?
+  trap - EXIT HUP INT TERM
+  if [ "$committed" -ne 1 ]; then
+    if [ "$changed" -eq 1 ]; then
+      mv "$previous" "$CONFIG_FILE" || { red "还原配置失败，备份保留在 $previous"; exit 1; }
+      red "应用配置失败，已还原原配置"
+    fi
+    if [ "$started" -eq 1 ]; then
+      recover_service "$old_id" "$old_image" || red "自动恢复失败，请检查服务日志"
+    fi
+    [ "$result" -ne 0 ] || result=1
+  fi
+  rm -f "$previous" "$candidate"
+  exit "$result"
 }
 
 restart_service(){
-  cd "$WORK_DIR"
-  docker compose up -d --force-recreate
+  local id
+  check_config || return 1
+  id=$(service_container) || return 1
+  if [ -n "$id" ]; then
+    docker restart "$id" || return 1
+  else
+    compose up -d --no-deps --no-recreate sing-box || return 1
+    id=$(service_container) || return 1
+  fi
+  [ -n "$id" ] && wait_service "$id" || return 1
   green "sing-box 已重启"
 }
 
 start_service(){
-  cd "$WORK_DIR"
-  docker compose up -d
+  local id
+  check_config || return 1
+  id=$(service_container) || return 1
+  if [ -n "$id" ]; then
+    docker start "$id" || return 1
+  else
+    compose up -d --no-deps --no-recreate sing-box || return 1
+    id=$(service_container) || return 1
+  fi
+  [ -n "$id" ] && wait_service "$id" || return 1
   green "sing-box 已启动"
 }
 
 stop_service(){
-  cd "$WORK_DIR"
-  docker compose down
+  compose stop sing-box
   green "sing-box 已停止"
 }
 
@@ -414,7 +570,7 @@ add_reality(){
   local port tag sni uuid short_id server_ip key_output private_key public_key inbound
   port=$(read_port "监听端口 [默认 443]: " 443) || return
 
-  if port_used "$port"; then
+  if port_used "$port" tcp; then
     red "端口 $port 可能已被占用，请换一个端口"
     return
   fi
@@ -433,7 +589,7 @@ add_reality(){
   short_id=$(openssl rand -hex 8)
   server_ip=$(public_ip)
 
-  key_output=$(docker run --rm "$SING_BOX_IMAGE" generate reality-keypair)
+  key_output=$(docker run --rm "$(runtime_image)" generate reality-keypair)
   private_key=$(printf '%s\n' "$key_output" | awk '/PrivateKey/ {print $2}')
   public_key=$(printf '%s\n' "$key_output" | awk '/PublicKey/ {print $2}')
 
@@ -468,7 +624,7 @@ add_reality(){
 JSON
 )
 
-  add_inbound "$inbound"
+  add_inbound "$inbound" || return 1
 
   cat >> "$INFO_FILE" <<EOFINFO
 
@@ -487,8 +643,6 @@ vless://$uuid@$server_ip:$port?encryption=none&flow=xtls-rprx-vision&security=re
 ==============================
 EOFINFO
 
-  check_config
-  restart_service
   open_port "$port" tcp
   green "VLESS Reality 入站已添加"
 }
@@ -499,7 +653,7 @@ add_hysteria2(){
   local port tag password sni cert_dir server_ip inbound cert_pin_hex password_uri tag_uri cert_mode cert_note link_host email
   port=$(read_port "监听端口 [默认 8443]: " 8443) || return
 
-  if port_used "$port"; then
+  if port_used "$port" udp; then
     red "端口 $port 可能已被占用，请换一个端口"
     return
   fi
@@ -578,7 +732,7 @@ add_hysteria2(){
 JSON
 )
 
-  add_inbound "$inbound"
+  add_inbound "$inbound" || return 1
 
   cat >> "$INFO_FILE" <<EOFINFO
 
@@ -602,10 +756,7 @@ pinnedPeerCertSha256: $cert_pin_hex
 ==============================
 EOFINFO
 
-  check_config
-  restart_service
   open_port "$port" udp
-  open_port "$port" tcp
   green "Hysteria2 入站已添加"
 }
 
@@ -615,7 +766,7 @@ add_anytls(){
   local port tag password sni cert_dir server_ip inbound cert_pin_hex password_uri tag_uri cert_mode cert_note link_host email
   port=$(read_port "监听端口 [默认 8444]: " 8444) || return
 
-  if port_used "$port"; then
+  if port_used "$port" tcp; then
     red "端口 $port 可能已被占用，请换一个端口"
     return
   fi
@@ -694,7 +845,7 @@ add_anytls(){
 JSON
 )
 
-  add_inbound "$inbound"
+  add_inbound "$inbound" || return 1
 
   cat >> "$INFO_FILE" <<EOFINFO
 
@@ -727,8 +878,6 @@ sing-box 客户端出站配置：
 ==============================
 EOFINFO
 
-  check_config
-  restart_service
   open_port "$port" tcp
   green "AnyTLS 入站已添加"
 }
@@ -738,11 +887,6 @@ add_door(){
 
   local port tag target target_port network inbound
   port=$(read_port "本地监听端口，例如 2080: " "") || return
-
-  if port_used "$port"; then
-    red "端口 $port 可能已被占用，请换一个端口"
-    return
-  fi
 
   read -rp "节点标签 [默认 door-$port]: " tag
   tag=${tag:-door-$port}
@@ -764,6 +908,10 @@ add_door(){
     tcp|udp) ;;
     *) red "网络类型只能是 tcp 或 udp"; return ;;
   esac
+  if port_used "$port" "$network"; then
+    red "端口 $port/$network 已被占用，请换一个端口"
+    return 1
+  fi
 
   inbound=$(cat <<JSON
 {
@@ -778,7 +926,7 @@ add_door(){
 JSON
 )
 
-  add_inbound "$inbound"
+  add_inbound "$inbound" || return 1
 
   cat >> "$INFO_FILE" <<EOFINFO
 
@@ -792,8 +940,6 @@ JSON
 ==============================
 EOFINFO
 
-  check_config
-  restart_service
   open_port "$port" "$network"
   green "Door 转发入站已添加"
 }
@@ -812,14 +958,15 @@ delete_inbound(){
     return
   fi
 
-  backup_config
+  backup_config || return 1
   local tmp
-  tmp=$(mktemp)
-  jq --arg tag "$tag" '.inbounds = [.inbounds[] | select(.tag != $tag)]' "$CONFIG_FILE" > "$tmp"
-  mv "$tmp" "$CONFIG_FILE"
+  tmp=$(mktemp "$CONFIG_DIR/.candidate.XXXXXX")
+  if ! jq --arg tag "$tag" '.inbounds = [.inbounds[] | select(.tag != $tag)]' "$CONFIG_FILE" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  apply_config "$tmp" || return 1
   remove_info_by_tag "$tag"
-  check_config
-  restart_service
   green "入站 $tag 已删除"
 }
 
@@ -1077,10 +1224,10 @@ add_config_menu(){
     read -rp "请选择: " a
 
     case "$a" in
-      1) add_reality; pause ;;
-      2) add_hysteria2; pause ;;
-      3) add_anytls; pause ;;
-      4) add_door; pause ;;
+      1) run_locked add_reality; pause ;;
+      2) run_locked add_hysteria2; pause ;;
+      3) run_locked add_anytls; pause ;;
+      4) run_locked add_door; pause ;;
       0) break ;;
       *) red "无效选择"; pause ;;
     esac
@@ -1117,19 +1264,90 @@ config_menu(){
 }
 
 logs(){
-  docker logs -f sing-box
+  compose logs -f --tail 100 sing-box
 }
 
 backup_config(){
   mkdir -p "$BACKUP_DIR"
-  local backup_file
+  local backup_file tmp
+  local files=(config docker-compose.yml)
   backup_file="$BACKUP_DIR/sing-box-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
-
-  tar -czf "$backup_file" -C "$WORK_DIR" config nodes.txt docker-compose.yml 2>/dev/null || true
+  [ ! -f "$INFO_FILE" ] || files+=(nodes.txt)
+  tmp=$(mktemp "$BACKUP_DIR/.backup.XXXXXX")
+  if ! tar -czf "$tmp" -C "$WORK_DIR" -- "${files[@]}" || ! tar -tzf "$tmp" >/dev/null; then
+    rm -f "$tmp"
+    red "配置备份失败，已停止后续操作"
+    return 1
+  fi
+  chmod 600 "$tmp"
+  mv "$tmp" "$backup_file"
   green "配置已备份：$backup_file"
 }
 
-restore_config(){
+begin_deployment(){
+  transaction=$(mktemp -d "$WORK_DIR/.deployment.XXXXXX") || return 1
+  committed=0 config_swapped=0 restore_info=0 deploy_started=0 old_id="" old_image=""
+  trap deployment_cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  cp -p "$COMPOSE_FILE" "$transaction/compose.original" || return 1
+  if [ -f "$INFO_FILE" ]; then
+    cp -p "$INFO_FILE" "$transaction/info.original" || return 1
+  fi
+  old_id=$(service_container) || return 1
+  if [ -n "$old_id" ]; then
+    old_image=$(docker inspect --format '{{.Image}}' "$old_id") || return 1
+  fi
+}
+
+deployment_cleanup(){
+  local result=$? recovered=1
+  trap - EXIT HUP INT TERM
+  if [ "$committed" -ne 1 ]; then
+    red "部署未完成，正在恢复变更前的配置"
+    if [ "$config_swapped" -eq 1 ]; then
+      if [ -d "$CONFIG_DIR" ]; then
+        mv "$CONFIG_DIR" "$transaction/failed-config" || recovered=0
+      fi
+      if [ "$recovered" -eq 1 ]; then
+        mv "$transaction/original-config" "$CONFIG_DIR" || recovered=0
+      fi
+    fi
+    if [ -f "$transaction/compose.original" ]; then
+      cp -p "$transaction/compose.original" "$COMPOSE_FILE" || recovered=0
+    fi
+    if [ "$restore_info" -eq 1 ]; then
+      if [ -f "$transaction/info.original" ]; then
+        cp -p "$transaction/info.original" "$INFO_FILE" || recovered=0
+      else
+        rm -f "$INFO_FILE" || recovered=0
+      fi
+    fi
+    if [ "$deploy_started" -eq 1 ] && [ "$recovered" -eq 1 ]; then
+      recover_service "$old_id" "$old_image" || recovered=0
+    fi
+    [ "$result" -ne 0 ] || result=1
+    if [ "$recovered" -ne 1 ]; then
+      red "自动恢复未完成，现场文件保留在：$transaction"
+      exit 1
+    fi
+  fi
+  rm -rf "$transaction"
+  exit "$result"
+}
+
+recreate_service(){
+  local id expected actual
+  expected=$(docker image inspect "$(compose_image)" --format '{{.Id}}') || return 1
+  compose up -d --no-deps --force-recreate sing-box || return 1
+  id=$(service_container) || return 1
+  [ -n "$id" ] && wait_service "$id" || return 1
+  actual=$(docker inspect --format '{{.Image}}' "$id") || return 1
+  [ "$actual" = "$expected" ] || { red "运行镜像与目标镜像不一致"; return 1; }
+}
+
+restore_config() (
   mkdir -p "$BACKUP_DIR"
 
   echo "可用备份："
@@ -1148,28 +1366,58 @@ restore_config(){
 
   read -rp "恢复会覆盖当前配置，确认？输入 y: " c
   if [ "$c" = "y" ]; then
-    tar -xzf "$file" -C "$WORK_DIR"
-    check_config
-    restart_service
+    prepare_runtime || return 1
+    backup_config || return 1
+    local transaction committed config_swapped restore_info deploy_started old_id old_image image
+    begin_deployment || return 1
+    mkdir "$transaction/staged" || return 1
+    # Only restore the three paths written by backup_config; reject links and traversal.
+    tar -tzf "$file" | awk '
+      /^\// || /(^|\/)\.\.(\/|$)/ { exit 1 }
+      !/^(config(\/|$)|nodes\.txt$|docker-compose\.yml$)/ { exit 1 }' || return 1
+    tar -tvzf "$file" | awk 'substr($0,1,1) != "-" && substr($0,1,1) != "d" { exit 1 }' || return 1
+    tar -xzf "$file" -C "$transaction/staged" --no-same-owner || return 1
+    [ -f "$transaction/staged/config/config.json" ] || return 1
+    image=$(compose_image "$transaction/staged/docker-compose.yml") || return 1
+    check_config "$transaction/staged/config/config.json" "$transaction/staged/config" "$image" || return 1
+    mv "$CONFIG_DIR" "$transaction/original-config" || return 1
+    config_swapped=1
+    mv "$transaction/staged/config" "$CONFIG_DIR" || return 1
+    cp -p "$transaction/staged/docker-compose.yml" "$COMPOSE_FILE" || return 1
+    restore_info=1
+    if [ -f "$transaction/staged/nodes.txt" ]; then
+      cp -p "$transaction/staged/nodes.txt" "$INFO_FILE" || return 1
+    else
+      rm -f "$INFO_FILE"
+    fi
+    deploy_started=1
+    recreate_service || return 1
+    committed=1
     green "配置已恢复并重启"
   else
     yellow "已取消"
   fi
-}
+)
 
 show_version(){
   echo "目标镜像：$SING_BOX_IMAGE"
   echo
   echo "当前 sing-box 容器版本："
-  docker exec sing-box sing-box version || true
+  local id
+  id=$(service_container) || return 1
+  if [ -n "$id" ]; then
+    docker exec "$id" sing-box version || true
+  else
+    yellow "没有找到已启动过的 sing-box 服务容器"
+  fi
 
   echo
   echo "当前本地镜像："
-  docker images "$SING_BOX_IMAGE" || true
+  docker images "$(compose_image)" || true
 
   echo
   echo "当前容器状态："
-  docker ps -a --filter name=sing-box
+  compose ps -a sing-box
 }
 
 show_bbr_status(){
@@ -1250,25 +1498,25 @@ system_menu(){
   done
 }
 
-update_singbox_image(){
-  install_base
+update_singbox_image() (
+  prepare_runtime || return 1
 
   yellow "更新前自动备份配置..."
-  backup_config
-
-  cd "$WORK_DIR"
-  sync_compose_image
+  backup_config || return 1
+  local transaction committed config_swapped restore_info deploy_started old_id old_image
+  begin_deployment || return 1
+  sync_compose_image || return 1
 
   yellow "拉取 sing-box 镜像：$SING_BOX_IMAGE"
   local pull_log
   pull_log=$(mktemp)
-  if ! docker compose pull 2>&1 | tee "$pull_log"; then
+  if ! compose pull sing-box 2>&1 | tee "$pull_log"; then
     if grep -qi 'denied' "$pull_log" && printf '%s' "$SING_BOX_IMAGE" | grep -q '^ghcr\.io/'; then
       red "GHCR 返回 denied，常见原因是 Docker 保存了失效的 ghcr.io 登录凭据。"
       read -rp "是否执行 docker logout ghcr.io 后重试？输入 y: " retry_ghcr
       if [ "$retry_ghcr" = "y" ]; then
         docker logout ghcr.io || true
-        docker compose pull
+        compose pull sing-box || { rm -f "$pull_log"; return 1; }
       else
         rm -f "$pull_log"
         return 1
@@ -1281,14 +1529,15 @@ update_singbox_image(){
   rm -f "$pull_log"
 
   yellow "使用目标镜像检查配置..."
-  check_config
+  check_config "$CONFIG_FILE" "$CONFIG_DIR" "$(compose_image)" || return 1
 
   yellow "配置检查通过，正在重启..."
-  docker compose up -d --force-recreate
-
+  deploy_started=1
+  recreate_service || return 1
+  committed=1
   green "sing-box 镜像已更新"
-  docker exec sing-box sing-box version || true
-}
+  docker exec "$(service_container)" sing-box version || true
+)
 
 update_script(){
   local tmp backup urls url ok old_sum new_sum
@@ -1369,10 +1618,10 @@ update_menu(){
     read -rp "请选择: " u
 
     case "$u" in
-      1) update_singbox_image; pause ;;
+      1) run_locked update_singbox_image; pause ;;
       2) show_version; pause ;;
       3) backup_config; pause ;;
-      4) restore_config; pause ;;
+      4) run_locked restore_config; pause ;;
       5) update_script; pause ;;
       6) install_shortcut; pause ;;
       0) break ;;
@@ -1399,6 +1648,7 @@ menu(){
   clear
   echo "======================================"
   echo " sing-box Docker 多入站管理脚本"
+  echo " 脚本版本：$SCRIPT_VERSION"
   echo " 镜像：$SING_BOX_IMAGE"
   echo "======================================"
   echo "1. 添加配置"
@@ -1418,11 +1668,11 @@ menu(){
 
   case "$num" in
     1) add_config_menu ;;
-    2) delete_inbound ;;
+    2) run_locked delete_inbound ;;
     3) config_menu ;;
-    4) start_service ;;
-    5) restart_service ;;
-    6) stop_service ;;
+    4) run_locked start_service ;;
+    5) run_locked restart_service ;;
+    6) run_locked stop_service ;;
     7) logs ;;
     8) update_menu ;;
     9) system_menu ;;
@@ -1443,4 +1693,6 @@ main(){
   done
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" = "$0" ]]; then
+  main "$@"
+fi

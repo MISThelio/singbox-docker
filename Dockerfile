@@ -5,7 +5,7 @@ ARG SING_BOX_VERSION
 RUN apk add --no-cache git
 WORKDIR /src
 RUN git clone --depth 1 --branch "${SING_BOX_VERSION}" https://github.com/SagerNet/sing-box.git .
-RUN go build -trimpath -ldflags "-s -w -buildid=" -o /out/sing-box ./cmd/sing-box
+RUN go build -tags "with_quic,with_utls" -trimpath -ldflags "-s -w -buildid=" -o /out/sing-box ./cmd/sing-box
 
 FROM alpine:3.22
 RUN apk add --no-cache ca-certificates tzdata
