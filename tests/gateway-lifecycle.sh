@@ -113,3 +113,15 @@ check_website
 [ "$(service_container)" = "$core_id" ]
 [ "$(docker inspect --format '{{.Id}}' "$website_name")" = "$website_id" ]
 echo 'PASS real certificate rotation preserves all three container IDs'
+
+backup_config
+archive=$(find "$BACKUP_DIR" -name '*.tar.gz' | head -n 1)
+shared_transaction shared_remove_website www.test.example
+if check_website; then echo 'FAIL removed website is still routed'; exit 1; fi
+restore_config <<INPUT
+$archive
+y
+INPUT
+check_website
+[ "$(docker inspect --format '{{.Id}}' "$website_name")" = "$website_id" ]
+echo 'PASS backup restore reattaches gateway mounts without recreating website app'
