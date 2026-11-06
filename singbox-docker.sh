@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
-SCRIPT_VERSION="2026.11.06.9"
+SCRIPT_VERSION="2026.11.06.10"
 
 SING_BOX_VERSION="${SING_BOX_VERSION:-latest}"
 SING_BOX_IMAGE="${SING_BOX_IMAGE:-ghcr.io/sagernet/sing-box:${SING_BOX_VERSION}}"
@@ -528,8 +528,12 @@ def info(path):
 def immutable(data):
     result = {s: dict(v) for s, v in data.items() if s != 'webroot_map'}
     result.get('lineage', {}).pop('version', None)
+    params = result.get('renewalparams', {})
     for k in ('authenticator', 'webroot_path', 'pref_challs', 'preferred_challenges'):
-        result.get('renewalparams', {}).pop(k, None)
+        params.pop(k, None)
+    # Certbot records an explicit --config-dir; the same directory as before changes nothing.
+    if params.get('config_dir') and os.path.realpath(params['config_dir']) == os.path.realpath(root):
+        params.pop('config_dir')
     return result
 def atomic_json(path, value):
     fd, tmp = tempfile.mkstemp(dir=path.parent)

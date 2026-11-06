@@ -53,10 +53,11 @@ fixture(){
     [[ "$*" == *--no-directory-hooks* && "$*" == *--webroot* && "$*" != *--force-renewal* ]]
     if [ "$FAIL_BEFORE" = 1 ]; then return 1; fi
     # Only the mock CLI rewrites fixture INIs; the production manager calls Certbot reconfigure.
-    python3 - "$LETSENCRYPT_DIR/renewal/$name.conf" "$CONFIG_DIR/gateway/acme" <<'PYMOCK'
+    python3 - "$LETSENCRYPT_DIR/renewal/$name.conf" "$CONFIG_DIR/gateway/acme" "$LETSENCRYPT_DIR" <<'PYMOCK'
 import pathlib, sys
 p = pathlib.Path(sys.argv[1])
-p.write_text(p.read_text().replace('authenticator = standalone', 'authenticator = webroot') +
+# Certbot 2.x also records the explicit --config-dir in renewalparams.
+p.write_text(p.read_text().replace('authenticator = standalone', 'authenticator = webroot\nconfig_dir = ' + sys.argv[3]) +
              '\nwebroot_path = ' + sys.argv[2] + ',\n[[webroot_map]]\nold.test.example = ' + sys.argv[2] + '\n')
 PYMOCK
     [ "$name" != "$FAIL_NAME" ]
@@ -320,6 +321,19 @@ domain_named_modified_hook_refused() (
   if shared_transaction gateway_initialize <<< y; then exit 1; fi
   unchanged old.test.example; [ ! -f "$TRACE" ]
 )
+foreign_config_dir_refused() (
+  fixture; legacy old.test.example hy2-old
+  python3 - "$LETSENCRYPT_DIR/renewal/old.test.example.conf" <<'PYEDIT'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); p.write_text(p.read_text().replace('authenticator = standalone', 'authenticator = standalone\nconfig_dir = /elsewhere'))
+PYEDIT
+  cp -p "$LETSENCRYPT_DIR/renewal/old.test.example.conf" "$WORK_DIR/old.test.example.original"
+  certbot_real_dir=$LETSENCRYPT_DIR
+  eval "$(declare -f certbot | sed '1s/certbot/mock_certbot/')"
+  certbot(){ mock_certbot "$@" || return; [ "$1" = --version ] && return 0
+    sed -i "s#^config_dir = $certbot_real_dir\$##; s#^config_dir = /elsewhere#config_dir = /changed#" "$LETSENCRYPT_DIR/renewal/old.test.example.conf"; }
+  if shared_transaction gateway_initialize <<< y 2>/dev/null; then exit 1; fi
+)
 domain_named_unused_refused() (
   fixture; domain_legacy old.test.example
   echo '{"inbounds":[],"outbounds":[{"type":"direct"}]}' > "$CONFIG_FILE"
@@ -331,7 +345,7 @@ for test in managed_success declined unknown_owner wrong_fingerprint unsafe_hook
   staging_failure later_failure disconnect_after_migration concurrent_change occupied_port empty_inventory \
   map_only_webroot unknown_new_renewal_keeps_entry changed_after_approval symlink_renewal_refused \
   restore_and_uninstall_preserve_validation menu_action_preserves_rollback explicit_migration_action certbot_lock \
-  domain_named_migration_success domain_named_modified_hook_refused domain_named_unused_refused; do
+  domain_named_migration_success domain_named_modified_hook_refused domain_named_unused_refused foreign_config_dir_refused; do
   run_test "$test"
 done
 echo "$passed certificate migration tests passed"

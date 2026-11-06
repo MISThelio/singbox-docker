@@ -73,7 +73,7 @@ sudo SCRIPT_URL=https://raw.githubusercontent.com/MISThelio/singbox-docker/main/
 ## 升级已有安装
 
 运行 `sb`，选择 `更新管理 -> 更新脚本自身`，然后退出菜单并重新执行 `sb`。
-当前版本在主菜单显示 `脚本版本：2026.11.06.9`。更新脚本本身不会更新镜像、启用共享入口或重启节点。
+当前版本在主菜单显示 `脚本版本：2026.11.06.10`。更新脚本本身不会更新镜像、启用共享入口或重启节点。
 
 sing-box 容器日志默认限制为 `10m x 3`（可用 `SINGBOX_LOG_MAX_SIZE` / `SINGBOX_LOG_MAX_FILE` 覆盖）。
 已有安装执行 `系统优化 -> 限制 sing-box 容器日志大小`，确认后用当前镜像重建容器，节点会断开几秒；
