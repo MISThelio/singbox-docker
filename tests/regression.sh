@@ -342,12 +342,31 @@ failed_creation_prints_no_node() (
   [ "$(cat "$INFO_FILE")" = original-info ]
 )
 
+dns_strategy_applies_through_candidate() (
+  fixture
+  detect_dns_strategy(){ printf ipv4_only; }
+  prepare_runtime(){ :; }
+  apply_config(){ jq -e '.dns.strategy == .route.default_domain_resolver.strategy and .route.default_domain_resolver.server == "local" and .inbounds == []' "$1" >/dev/null && mv "$1" "$CONFIG_FILE"; }
+  set_dns_strategy <<< '' > /dev/null
+  [ "$(current_dns_strategy)" = ipv4_only ]
+  set_dns_strategy <<< '3' > /dev/null
+  [ "$(current_dns_strategy)" = prefer_ipv4 ]
+  jq -e '[.dns.servers[] | select(.tag == "local")] | length == 1' "$CONFIG_FILE" >/dev/null
+)
+
+dns_strategy_failure_keeps_config() (
+  fixture
+  prepare_runtime(){ :; }; check_config(){ return 1; }
+  if set_dns_strategy <<< '2' > /dev/null; then exit 1; fi
+  cmp "$CONFIG_FILE" "$WORK_DIR/original.json"
+)
+
 for test in reject_candidate commit_candidate rollback_candidate rollback_on_disconnect \
   backup_failure backup_without_info regular_restart_keeps_container validate_running_image \
   protocol_specific_ports find_renamed_container recover_deleted_container restore_failure readiness_rejects_crash \
   backup_integrity_failure update_requires_backup failed_recovery_retains_evidence stop_replacement_before_recovery \
   shared_operation_rollback shared_preflight_failure_is_non_disruptive shared_refuses_unmanaged_ports shared_delete_preserves_website \
-  failed_creation_prints_no_node; do
+  failed_creation_prints_no_node dns_strategy_applies_through_candidate dns_strategy_failure_keeps_config; do
   run_test "$test"
 done
 for kind in reality hysteria2 anytls door; do run_test creation_prints_current_node "$kind"; done

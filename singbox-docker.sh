@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
-SCRIPT_VERSION="2026.11.06.6"
+SCRIPT_VERSION="2026.11.06.7"
 
 SING_BOX_VERSION="${SING_BOX_VERSION:-latest}"
 SING_BOX_IMAGE="${SING_BOX_IMAGE:-ghcr.io/sagernet/sing-box:${SING_BOX_VERSION}}"
@@ -128,6 +128,63 @@ write_default_config(){
   ]
 }
 JSON
+  local strategy tmp
+  strategy=$(detect_dns_strategy)
+  tmp=$(mktemp "$CONFIG_DIR/.default.XXXXXX") || return 1
+  dns_strategy_filter "$strategy" "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE" || rm -f "$tmp"
+  chmod 600 "$CONFIG_FILE"
+}
+
+# Servers without a working IPv6 route must not resolve AAAA first; otherwise
+# every dual-stack site fails with "network is unreachable" instead of using IPv4.
+detect_dns_strategy(){
+  if ip -6 route get 2606:4700:4700::1111 >/dev/null 2>&1; then
+    printf 'prefer_ipv4'
+  else
+    printf 'ipv4_only'
+  fi
+}
+
+dns_strategy_filter(){
+  jq --arg strategy "$1" '
+    .dns = ((.dns // {}) | .servers = (.servers // []))
+    | (if any(.dns.servers[]; .tag == "local") then . else .dns.servers += [{type:"local",tag:"local"}] end)
+    | .dns.strategy = $strategy
+    | .route = ((.route // {}) + {default_domain_resolver:{server:"local",strategy:$strategy}})' "$2"
+}
+
+current_dns_strategy(){
+  jq -r '.route.default_domain_resolver.strategy // .dns.strategy // "默认（未设置）"' "$CONFIG_FILE"
+}
+
+set_dns_strategy(){
+  prepare_runtime || return 1
+  local detected choice strategy tmp
+  detected=$(detect_dns_strategy)
+  echo "当前出站解析策略：$(current_dns_strategy)"
+  if [ "$detected" = ipv4_only ]; then
+    yellow "检测到本机没有可用的 IPv6 出口，建议 ipv4_only"
+  else
+    green "检测到本机有 IPv6 出口，建议 prefer_ipv4"
+  fi
+  echo "1. 自动（$detected，默认）"
+  echo "2. ipv4_only（仅 IPv4）"
+  echo "3. prefer_ipv4（优先 IPv4，失败再用 IPv6）"
+  echo "0. 返回"
+  read -rp "请选择 [默认 1]: " choice || return 0
+  case "${choice:-1}" in
+    1) strategy="$detected" ;;
+    2) strategy=ipv4_only ;;
+    3) strategy=prefer_ipv4 ;;
+    0) return 0 ;;
+    *) red "无效选择"; return 1 ;;
+  esac
+  tmp=$(mktemp "$CONFIG_DIR/.candidate.XXXXXX") || return 1
+  dns_strategy_filter "$strategy" "$CONFIG_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+  if cmp -s "$tmp" "$CONFIG_FILE"; then rm -f "$tmp"; green "已是 $strategy，无需修改"; return 0; fi
+  yellow "应用后会重启 sing-box，所有节点断开几秒"
+  apply_config "$tmp" || return 1
+  green "出站解析策略已设为 $strategy"
 }
 
 write_compose_file(){
@@ -2508,6 +2565,7 @@ system_menu(){
     echo "2. 启用 BBR"
     echo "3. 初始化/修复 sing-box Docker 环境"
     echo "4. 限制 sing-box 容器日志大小"
+    echo "5. 出站 IPv4/IPv6 解析策略"
     echo "0. 返回主菜单"
     echo "======================================"
     read -rp "请选择: " s || return 0
@@ -2517,6 +2575,7 @@ system_menu(){
       2) run_menu_action enable_bbr; pause ;;
       3) run_menu_action initialize_and_start; pause ;;
       4) run_menu_action run_locked enable_log_rotation; pause ;;
+      5) run_menu_action run_locked set_dns_strategy; pause ;;
       0) break ;;
       *) red "无效选择"; pause ;;
     esac
