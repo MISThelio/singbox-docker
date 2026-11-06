@@ -91,6 +91,20 @@ EOF
   mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
 }
 
+domain_legacy(){
+  local name="$1" dir="$CONFIG_DIR/cert-$1"
+  legacy "$name" placeholder
+  rm -rf "$CONFIG_DIR/cert-placeholder" "$LETSENCRYPT_DIR/renewal-hooks/deploy/singbox-docker-placeholder.sh"
+  mkdir -p "$dir"
+  cp "$TEST_ROOT/cert.pem" "$dir/cert.pem"; cp "$TEST_ROOT/key.pem" "$dir/private.key"
+  domain_cert_hook_contents "$name" > "$LETSENCRYPT_DIR/renewal-hooks/deploy/singbox-${name//./-}.sh"
+  chmod 700 "$LETSENCRYPT_DIR/renewal-hooks/deploy/singbox-${name//./-}.sh"
+  jq --arg name "$name" '.inbounds = [{type:"hysteria2",tag:"hy2-443",tls:{
+    certificate_path:("/etc/sing-box/cert-"+$name+"/cert.pem"),key_path:("/etc/sing-box/cert-"+$name+"/private.key")}}]' \
+    "$CONFIG_FILE" > "$CONFIG_FILE.tmp"
+  mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+}
+
 unchanged(){
   local name
   for name in "$@"; do cmp "$WORK_DIR/$name.original" "$LETSENCRYPT_DIR/renewal/$name.conf"; done
@@ -294,10 +308,30 @@ PYLOCK
   cmp "$WORK_DIR/old.test.example.original" "$LETSENCRYPT_DIR/renewal/old.test.example.conf"
 )
 
+domain_named_migration_success() (
+  fixture; domain_legacy old.test.example
+  shared_transaction gateway_initialize <<< y
+  jq -e 'length == 1 and .[0].params.authenticator == "webroot"' < <(certificate_inventory) >/dev/null
+  cmp "$LETSENCRYPT_DIR/renewal-hooks/deploy/singbox-old-test-example.sh" <(domain_cert_hook_contents old.test.example)
+)
+domain_named_modified_hook_refused() (
+  fixture; domain_legacy old.test.example
+  echo '# edited' >> "$LETSENCRYPT_DIR/renewal-hooks/deploy/singbox-old-test-example.sh"
+  if shared_transaction gateway_initialize <<< y; then exit 1; fi
+  unchanged old.test.example; [ ! -f "$TRACE" ]
+)
+domain_named_unused_refused() (
+  fixture; domain_legacy old.test.example
+  echo '{"inbounds":[],"outbounds":[{"type":"direct"}]}' > "$CONFIG_FILE"
+  if shared_transaction gateway_initialize <<< y; then exit 1; fi
+  unchanged old.test.example; [ ! -f "$TRACE" ]
+)
+
 for test in managed_success declined unknown_owner wrong_fingerprint unsafe_hooks old_certbot partial_failure \
   staging_failure later_failure disconnect_after_migration concurrent_change occupied_port empty_inventory \
   map_only_webroot unknown_new_renewal_keeps_entry changed_after_approval symlink_renewal_refused \
-  restore_and_uninstall_preserve_validation menu_action_preserves_rollback explicit_migration_action certbot_lock; do
+  restore_and_uninstall_preserve_validation menu_action_preserves_rollback explicit_migration_action certbot_lock \
+  domain_named_migration_success domain_named_modified_hook_refused domain_named_unused_refused; do
   run_test "$test"
 done
 echo "$passed certificate migration tests passed"

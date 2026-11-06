@@ -361,12 +361,21 @@ dns_strategy_failure_keeps_config() (
   cmp "$CONFIG_FILE" "$WORK_DIR/original.json"
 )
 
+ip_direct_links_keep_domain_sni() (
+  fixture
+  block=$'vless://u@vl.example.com:443?security=reality&sni=vl.example.com#v\nhysteria2://p@1.2.3.4:5443?insecure=1&sni=bing.com#self'
+  out=$(ip_direct_links "$block" 203.0.113.10)
+  grep -qx 'vless://u@203.0.113.10:443?security=reality&sni=vl.example.com#v' <<< "$out"
+  ! grep -q 'bing.com' <<< "$out"
+  [ -z "$(ip_direct_links "$block" SERVER_IP)" ]
+)
+
 for test in reject_candidate commit_candidate rollback_candidate rollback_on_disconnect \
   backup_failure backup_without_info regular_restart_keeps_container validate_running_image \
   protocol_specific_ports find_renamed_container recover_deleted_container restore_failure readiness_rejects_crash \
   backup_integrity_failure update_requires_backup failed_recovery_retains_evidence stop_replacement_before_recovery \
   shared_operation_rollback shared_preflight_failure_is_non_disruptive shared_refuses_unmanaged_ports shared_delete_preserves_website \
-  failed_creation_prints_no_node dns_strategy_applies_through_candidate dns_strategy_failure_keeps_config; do
+  failed_creation_prints_no_node dns_strategy_applies_through_candidate dns_strategy_failure_keeps_config ip_direct_links_keep_domain_sni; do
   run_test "$test"
 done
 for kind in reality hysteria2 anytls door; do run_test creation_prints_current_node "$kind"; done

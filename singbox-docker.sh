@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
-SCRIPT_VERSION="2026.11.06.7"
+SCRIPT_VERSION="2026.11.06.9"
 
 SING_BOX_VERSION="${SING_BOX_VERSION:-latest}"
 SING_BOX_IMAGE="${SING_BOX_IMAGE:-ghcr.io/sagernet/sing-box:${SING_BOX_VERSION}}"
@@ -643,6 +643,46 @@ fi
 EOFHOOK
 }
 
+# Hook written by the one-off domain migration (diagnostics/migrate_lionverse.py):
+# certificates live in cert-<domain>/ and the hook name uses dashes instead of dots.
+domain_cert_hook_contents(){
+  local domain="$1"
+  cat <<EOFHOOK
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+[ "\${RENEWED_LINEAGE:-}" = $LETSENCRYPT_DIR/live/$domain ] || exit 0
+exec 9>$WORK_DIR/.operation.lock
+flock -w 60 9
+destination=$CONFIG_DIR/cert-$domain
+cert=\$(mktemp "\$destination/.cert.XXXXXX")
+key=\$(mktemp "\$destination/.key.XXXXXX")
+trap 'rm -f "\$cert" "\$key"' EXIT
+install -m 0600 "\$RENEWED_LINEAGE/fullchain.pem" "\$cert"
+install -m 0600 "\$RENEWED_LINEAGE/privkey.pem" "\$key"
+openssl x509 -in "\$cert" -checkhost $domain -noout
+cert_public=\$(openssl x509 -in "\$cert" -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum)
+key_public=\$(openssl pkey -in "\$key" -pubout -outform DER | sha256sum)
+[ "\$cert_public" = "\$key_public" ]
+mv "\$key" "\$destination/private.key"
+mv "\$cert" "\$destination/cert.pem"
+# sing-box watches certificate_path and key_path and reloads renewed files.
+EOFHOOK
+}
+
+domain_certificate_owned(){
+  local name="$1" expected="$2" cert_dir="$CONFIG_DIR/cert-$1" hook actual
+  hook="$LETSENCRYPT_DIR/renewal-hooks/deploy/singbox-${name//./-}.sh"
+  [ -f "$hook" ] && [ ! -L "$hook" ] || return 1
+  cmp -s "$hook" <(domain_cert_hook_contents "$name") || return 1
+  jq -e --arg cert "/etc/sing-box/cert-$name/cert.pem" --arg key "/etc/sing-box/cert-$name/private.key" '
+    any(.inbounds[]; (.type == "hysteria2" or .type == "anytls") and .tls.certificate_path == $cert and .tls.key_path == $key)' \
+    "$CONFIG_FILE" >/dev/null || return 1
+  actual=$(cert_pin_sha256_hex "$cert_dir/cert.pem") || return 1
+  [ "$actual" = "$expected" ] || return 1
+  validate_certificate "$name" "$cert_dir/cert.pem" "$cert_dir/private.key" >/dev/null 2>&1
+}
+
 certificate_owned(){
   local name="$1" inventory="$2" tag cert_dir hook expected actual
   valid_domain "$name" || return 1
@@ -663,7 +703,7 @@ certificate_owned(){
   done < <(jq -r '.inbounds[] | select(.type == "hysteria2" or .type == "anytls") |
     select(.tls.certificate_path == ("/etc/sing-box/cert-"+.tag+"/cert.pem") and
            .tls.key_path == ("/etc/sing-box/cert-"+.tag+"/private.key")) | .tag' "$CONFIG_FILE")
-  return 1
+  domain_certificate_owned "$name" "$expected"
 }
 
 certificate_migration_plan(){
@@ -1385,12 +1425,26 @@ remove_info_by_tag(){
   mv "$tmp" "$INFO_FILE"
 }
 
+# Domestic resolvers may return 127.0.0.1 for a domain (pollution or blocklists).
+# Connecting by IP with the domain kept as SNI still matches the certificate and SNI routing.
+ip_direct_links(){
+  local block="$1" ip="$2" links
+  [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 0
+  links=$(printf '%s\n' "$block" \
+    | grep -E '^(vless|hysteria2|anytls)://[^@]+@[^]:/?#[]*[a-zA-Z][^]:/?#[]*:[0-9]+\?(.*&)?sni=' \
+    | sed -E "s#^([a-z0-9]+://[^@]+@)[^:/?#]+(:[0-9]+\\?)#\\1$ip\\2#") || true
+  [ -n "$links" ] || return 0
+  echo "IP 直连链接（本地 DNS 把域名解析到 127.0.0.1 或错误地址时使用，SNI 保持域名）："
+  printf '%s\n' "$links"
+}
+
 print_created_node(){
   local block
   block=$(latest_info_block_by_tag "$1") || { red "节点信息读取失败，请通过配置查看菜单核对"; return 1; }
   echo
   yellow "本次节点配置（含连接凭据，请勿公开）："
   printf '%s\n' "$block"
+  ip_direct_links "$block" "$(public_ip)"
 }
 
 check_config(){
@@ -2015,6 +2069,7 @@ show_info(){
         block=$(latest_info_block_by_tag "$tag" || true)
         if [ -n "$block" ]; then
           printf '%s\n' "$block"
+          ip_direct_links "$block" "$server_ip"
         else
           echo
           echo "=============================="
@@ -2033,6 +2088,7 @@ show_info(){
         block=$(latest_info_block_by_tag "$tag" || true)
         if [ -n "$block" ]; then
           printf '%s\n' "$block"
+          ip_direct_links "$block" "$server_ip"
         else
           echo
           echo "=============================="
