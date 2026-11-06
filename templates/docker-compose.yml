@@ -8,3 +8,8 @@ services:
       - ./config:/etc/sing-box
       - ./data:/var/lib/sing-box
     command: -D /var/lib/sing-box -C /etc/sing-box run
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

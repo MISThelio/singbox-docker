@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
-SCRIPT_VERSION="2026.11.06.5"
+SCRIPT_VERSION="2026.11.06.6"
 
 SING_BOX_VERSION="${SING_BOX_VERSION:-latest}"
 SING_BOX_IMAGE="${SING_BOX_IMAGE:-ghcr.io/sagernet/sing-box:${SING_BOX_VERSION}}"
@@ -19,6 +19,9 @@ SCRIPT_URL="${SCRIPT_URL:-$DEFAULT_SCRIPT_URL}"
 SCRIPT_ACCEPT="${SCRIPT_ACCEPT:-application/vnd.github.raw}"
 NGINX_IMAGE="${NGINX_IMAGE:-nginx:stable-alpine}"
 LETSENCRYPT_DIR="${LETSENCRYPT_DIR:-/etc/letsencrypt}"
+# Docker json-file has no size limit by default; info logs grow with every connection.
+SINGBOX_LOG_MAX_SIZE="${SINGBOX_LOG_MAX_SIZE:-10m}"
+SINGBOX_LOG_MAX_FILE="${SINGBOX_LOG_MAX_FILE:-3}"
 
 green(){ printf '\033[32m%s\033[0m\n' "$1"; }
 yellow(){ printf '\033[33m%s\033[0m\n' "$1"; }
@@ -144,7 +147,38 @@ services:
       - ./config:/etc/sing-box
       - ./data:/var/lib/sing-box
     command: -D /var/lib/sing-box -C /etc/sing-box run
+    logging:
+      driver: json-file
+      options:
+        max-size: "${SINGBOX_LOG_MAX_SIZE}"
+        max-file: "${SINGBOX_LOG_MAX_FILE}"
 YAML
+}
+
+sync_compose_logging(){
+  local tmp
+  tmp=$(mktemp "$WORK_DIR/.compose.XXXXXX")
+  if ! compose config --no-interpolate --no-env-resolution --no-path-resolution --format json \
+    | jq --arg size "$SINGBOX_LOG_MAX_SIZE" --arg files "$SINGBOX_LOG_MAX_FILE" \
+      '.services["sing-box"].logging = {driver:"json-file",options:{"max-size":$size,"max-file":$files}}' > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if ! docker compose --project-directory "$WORK_DIR" -f "$tmp" config -q; then
+    rm -f "$tmp"
+    return 1
+  fi
+  chmod 600 "$tmp"
+  mv "$tmp" "$COMPOSE_FILE"
+}
+
+container_log_limited(){
+  local size
+  size=$(docker inspect --format '{{.HostConfig.LogConfig.Type}} {{index .HostConfig.LogConfig.Config "max-size"}}' "$1") || return 1
+  case "$size" in
+    'json-file '?*|'local '*|'journald '*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 sync_compose_image(){
@@ -787,7 +821,7 @@ gateway_render(){
   [[ "$tls_port" =~ ^[0-9]+$ ]] && [ "$tls_port" -ge 1024 ] && [ "$tls_port" -le 65535 ] || return 1
   {
     if [ "$(jq -r '.dynamic_stream' "$state")" = true ]; then echo 'load_module /usr/lib/nginx/modules/ngx_stream_module.so;'; fi
-    printf 'worker_processes auto;\nerror_log /dev/stderr warn;\npid /tmp/nginx.pid;\nevents { worker_connections 2048; }\n'
+    printf 'worker_processes auto;\nerror_log /dev/stderr warn;\npid /tmp/nginx.pid;\nworker_rlimit_nofile 65535;\nevents { worker_connections 16384; }\n'
     printf 'stream {\n log_format ingress "$remote_addr $ssl_preread_server_name $status $bytes_sent $bytes_received $session_time";\n access_log /dev/stdout ingress;\n map $ssl_preread_server_name $destination {\n default 127.0.0.1:%s;\n' "$tls_port"
     while IFS=$'\t' read -r domain kind port; do
       valid_domain "$domain" || return 1
@@ -844,7 +878,7 @@ gateway_apply(){
     if ! compose config --no-interpolate --no-env-resolution --no-path-resolution --format json | jq \
       --arg image "$image" --arg source "$CONFIG_DIR/gateway" '
       .services["singbox-gateway"] = {image:$image,restart:"unless-stopped",network_mode:"host",
-        labels:{"io.singbox-docker.gateway":"true"},entrypoint:["nginx"],
+        labels:{"io.singbox-docker.gateway":"true"},entrypoint:["nginx"],ulimits:{nofile:{soft:65535,hard:65535}},
         command:["-c","/etc/sb-gateway/nginx.conf","-g","daemon off;"],
         volumes:[{type:"bind",source:$source,target:"/etc/sb-gateway",read_only:true}],
         logging:{driver:"json-file",options:{"max-size":"10m","max-file":"3"}}}' > "$tmp"; then
@@ -2424,6 +2458,41 @@ EOFBBR
   fi
 }
 
+enable_log_rotation() (
+  prepare_runtime || return 1
+  local id confirm transaction committed config_swapped restore_info deploy_started old_id old_image
+  id=$(service_container) || return 1
+  if [ -n "$id" ] && container_log_limited "$id"; then
+    sync_compose_logging || return 1
+    green "sing-box 容器日志已限制为 ${SINGBOX_LOG_MAX_SIZE} x ${SINGBOX_LOG_MAX_FILE}"
+    return 0
+  fi
+  if [ -z "$id" ]; then
+    sync_compose_logging || return 1
+    green "已写入 Compose，sing-box 启动后生效"
+    return 0
+  fi
+  yellow "当前 sing-box 容器日志没有大小限制，需要重建容器才能生效。"
+  yellow "重建会让所有节点断开几秒，配置和当前镜像版本保持不变。"
+  read -rp "现在重建？输入 y；直接回车只写入 Compose，下次更新镜像时生效: " confirm || confirm=""
+  if [ "$confirm" != y ]; then
+    sync_compose_logging || return 1
+    yellow "已写入 Compose，下次更新 sing-box 镜像时生效"
+    return 0
+  fi
+  backup_config || return 1
+  begin_deployment || return 1
+  sync_compose_logging || return 1
+  # Recreate with the running image ID so a newer pulled tag is not deployed silently.
+  sync_compose_image "$old_image" || return 1
+  check_config "$CONFIG_FILE" "$CONFIG_DIR" "$old_image" || return 1
+  deploy_started=1
+  recreate_service || return 1
+  container_log_limited "$(service_container)" || { red "新容器未应用日志限制"; return 1; }
+  committed=1
+  green "sing-box 已重建，日志限制为 ${SINGBOX_LOG_MAX_SIZE} x ${SINGBOX_LOG_MAX_FILE}"
+)
+
 initialize_and_start(){
   install_base
   start_service
@@ -2438,6 +2507,7 @@ system_menu(){
     echo "1. 查看 BBR 状态"
     echo "2. 启用 BBR"
     echo "3. 初始化/修复 sing-box Docker 环境"
+    echo "4. 限制 sing-box 容器日志大小"
     echo "0. 返回主菜单"
     echo "======================================"
     read -rp "请选择: " s || return 0
@@ -2446,6 +2516,7 @@ system_menu(){
       1) run_menu_action show_bbr_status; pause ;;
       2) run_menu_action enable_bbr; pause ;;
       3) run_menu_action initialize_and_start; pause ;;
+      4) run_menu_action run_locked enable_log_rotation; pause ;;
       0) break ;;
       *) red "无效选择"; pause ;;
     esac
@@ -2460,6 +2531,7 @@ update_singbox_image() (
   local transaction committed config_swapped restore_info deploy_started old_id old_image
   begin_deployment || return 1
   sync_compose_image || return 1
+  sync_compose_logging || return 1
 
   yellow "拉取 sing-box 镜像：$SING_BOX_IMAGE"
   local pull_log
